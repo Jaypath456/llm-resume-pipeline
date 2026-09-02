@@ -1,0 +1,24 @@
+# Secrets -- never commit real API keys
+.env
+*.env
+
+# Personal data -- never commit your real resume content or generated output
+Master_Resume_Content.md
+jobs/
+output/
+.processed_jobs.json
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# LaTeX build artifacts
+*.aux
+*.log
+*.out
+
+# OS junk
+.DS_Store
+
