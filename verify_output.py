@@ -61,7 +61,30 @@ def extract_text(pdf_path: Path) -> str:
     # (e.g. "real-\ntime") -- rare, but if a compound-word bullet ever reads
     # oddly in a proofread flag, worth checking the PDF directly before
     # trusting the flag.
+
+    # Known hyphenated compound terms that must NEVER be merged by the
+    # line-wrap dehyphenation regex below, even if they happen to wrap right
+    # at their own hyphen. Confirmed real case: "scikit-learn" wrapped across
+    # a line in a long skills list, the regex merged it into "scikitlearn",
+    # Groq flagged it as a typo, and the proofread-fix loop couldn't even
+    # locate the source to fix it -- because the source was already correct.
+    PROTECTED_HYPHENATED_TERMS = [
+        "scikit-learn", "real-time", "self-attention", "co-located",
+        "e-commerce", "state-of-the-art", "full-stack",
+    ]
+    PLACEHOLDER = "\x00HY\x00"
+    protected_map = {}
+    for i, term in enumerate(PROTECTED_HYPHENATED_TERMS):
+        key = f"{PLACEHOLDER}{i}{PLACEHOLDER}"
+        pattern = re.escape(term).replace(r"\-", r"-\s*\n?\s*")
+        text, n = re.subn(pattern, key, text, flags=re.IGNORECASE)
+        if n:
+            protected_map[key] = term
+
     text = re.sub(r"(\w)-\n\s*([A-Za-z]\w*)", r"\1\2", text)
+
+    for key, term in protected_map.items():
+        text = text.replace(key, term)
 
     return text
 

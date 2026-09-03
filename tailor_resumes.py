@@ -1257,6 +1257,15 @@ Rules:
 {close_instruction}
 - Mention the Master's in Computer Science; only if the JD is AI/ML-focused, note relevant coursework/project work in agentic AI -- do not call it a "capstone."
 - Plain text output only, no markdown formatting, no subject line.
+- MUST include a complete letter structure, in this exact order:
+  1. Your name, city/state, email, phone (one line each, no header formatting)
+  2. Today's date
+  3. A blank line, then "Dear Hiring Team," (or "Dear [Company] Hiring Team," if a specific
+     name isn't available) -- never invent a specific person's name.
+  4. The body paragraphs.
+  5. A closing line thanking them for their time and consideration.
+  6. "Sincerely," followed by your name on the next line.
+- Do not omit any of these six elements. A letter missing the header, date, salutation, or closing is incomplete.
 - If the tailored content's keyword_audit shows major unsupported Tier-1 requirements (e.g. a large required-years-of-experience gap, or a core required skill marked unsupported), do not write around this with confident generalities -- keep claims scoped to what's actually backed by the tailored content, and do not imply seniority or domain experience beyond what's in the master content.
 """
     raw = call_gemini(prompt)

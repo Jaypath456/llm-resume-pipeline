@@ -5,6 +5,16 @@ Tailors a resume to a specific job description using Gemini, verifies the
 model's self-report), and auto-corrects only what's genuinely broken —
 before falling back to a human review flag.
 
+## Project Scope
+
+This is a side project exploring reliable verification loops for
+LLM-generated output, using resume tailoring as the test case. It does not
+generate or submit my actual job applications.
+
+The focus is on the engineering problem: how to verify an LLM-generated
+artifact against deterministic ground truth, catch failures that the model
+misses, and retry or escalate only when necessary.
+
 ## Why this exists
 
 LLMs are confident about their own output being correct, even when it
