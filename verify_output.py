@@ -1,21 +1,3 @@
-#!/usr/bin/env python3
-"""
-verify_output.py -- verification + standalone page-overflow recovery for a
-job's finalized PDF.
-
-verify_job() is pure measurement: page count (pypdf) + proofread (Groq),
-writes verification_report.json, never touches the .tex or recompiles.
-Called directly by process_job() in tailor_resumes.py after every compile
-attempt (page count) and once more at the end (page count + proofread).
-
-Note: as of the current tailor_resumes.py, page-count overflow is already
-caught and auto-corrected INSIDE process_job()'s own retry loop -- the
-fix_page_overflow()/verify_and_fix_job() functions below are now mainly a
-standalone safety net: for older output folders that predate that wiring,
-for a job that exhausted MAX_LAYOUT_RETRIES without converging, or for
-manually re-checking a folder without spending another Gemini call on the
-full pipeline. Run directly via `python verify_output.py <output_folder>`.
-"""
 import os
 import re
 import json
@@ -39,35 +21,10 @@ def extract_text(pdf_path: Path) -> str:
     )
     text = result.stdout
 
-    # pdftotext inserts a form feed (\f) as its own page-break marker on any
-    # multi-page PDF -- that's pdftotext's convention, not corrupted resume
-    # text.
-    text = text.replace("\f", "")
 
-    # pdftotext renders \item bullet glyphs from Latin Modern/Symbol fonts as
-    # Private Use Area codepoints (U+E000-U+F8FF), which have no real meaning
-    # outside that font.
+    text = text.replace("\f", "")
     text = re.sub(r"[\uE000-\uF8FF\x80-\x9F\uFFFD]", "", text)
 
-    # pdflatex's own justification hyphenates a word across a line break when
-    # it doesn't fit -- normal, correct typesetting, and the PDF renders it
-    # properly. pdftotext captures that hyphen+linebreak literally though, so
-    # e.g. "configurations" wrapped mid-word comes back as
-    # "con-\nfigurations", indistinguishable from a real typo to Groq. Rejoin
-    # any hyphen immediately followed by a line break and a lowercase
-    # continuation.
-    # Caveat: this can't perfectly tell a line-wrap hyphen apart from a
-    # genuine compound word that happens to wrap right after its own hyphen
-    # (e.g. "real-\ntime") -- rare, but if a compound-word bullet ever reads
-    # oddly in a proofread flag, worth checking the PDF directly before
-    # trusting the flag.
-
-    # Known hyphenated compound terms that must NEVER be merged by the
-    # line-wrap dehyphenation regex below, even if they happen to wrap right
-    # at their own hyphen. Confirmed real case: "scikit-learn" wrapped across
-    # a line in a long skills list, the regex merged it into "scikitlearn",
-    # Groq flagged it as a typo, and the proofread-fix loop couldn't even
-    # locate the source to fix it -- because the source was already correct.
     PROTECTED_HYPHENATED_TERMS = [
         "scikit-learn", "real-time", "self-attention", "co-located",
         "e-commerce", "state-of-the-art", "full-stack",
@@ -118,10 +75,8 @@ inside string values:
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
-        # Model likely emitted a raw newline/control character inside a
-        # string value -- strict json.loads rejects this even though it's
-        # a common, harmless model quirk. strict=False tolerates control
-        # characters inside strings instead of failing outright.
+        # Model occasionally emits a raw control character inside a string
+        # value; strict=False tolerates that instead of failing outright.
         try:
             return json.loads(raw, strict=False)
         except json.JSONDecodeError as e:
@@ -135,18 +90,13 @@ inside string values:
 
 def verify_job(out_dir: Path, pdf_path: Path) -> dict:
     """
-    Runs both checks for a single job's finalized PDF and writes
-    verification_report.json into that job's own output folder. Pure
-    measurement -- never writes to the .tex or recompiles. Called directly
-    by process_job() in tailor_resumes.py -- no manual invocation, no
-    folder discovery, no separate step for you to remember.
+    Runs both checks for a job's finalized PDF and writes
+    verification_report.json. Pure measurement -- never writes to the .tex
+    or recompiles.
 
-    "needs_review" is the single source of truth for whether this job's
-    output is trustworthy as-is -- True if the PDF isn't 1 page, or if the
-    Groq proofread came back non-clean (or couldn't be parsed, since a
-    parse_error means "clean" is unknown, not confirmed true). Callers
-    should read this field directly instead of re-deriving it from
-    page_check/proofread separately.
+    "needs_review" is the source of truth for whether this job's output is
+    trustworthy as-is: True if the PDF isn't 1 page, or if the Groq
+    proofread came back non-clean or couldn't be parsed.
     """
     page_report = check_page_count(pdf_path)
 
@@ -174,15 +124,11 @@ def verify_job(out_dir: Path, pdf_path: Path) -> dict:
 
 def fix_page_overflow(out_dir: Path, pdf_path: Path, max_retries: int = 3) -> dict:
     """
-    Standalone recovery pass for a PDF that's still >1 page -- e.g. an older
-    output folder that predates page-count checking being wired into
-    process_job()'s own retry loop, or a job that exhausted
-    MAX_LAYOUT_RETRIES there without converging. Reloads the content this
-    job was built from (content.json) and the JD it was tailored against
-    (jd_text.txt) -- both saved by process_job() so this can run
-    independently, without re-calling Gemini's content-tailoring step.
-    Requires GEMINI_API_KEY_1 (and optionally _2..._5), since fix_layout()
-    itself calls Gemini.
+    Standalone recovery pass for a PDF still >1 page. Reloads content.json
+    and jd_text.txt (saved by process_job()) so this can run independently
+    without re-calling Gemini's content-tailoring step. Requires
+    GEMINI_API_KEY_1 (and optionally _2..._5), since fix_layout() calls
+    Gemini.
 
     Returns {"attempted": bool, "reason": str (if not attempted),
              "retries_used": int, "final_page_count": int, "resolved": bool}.
@@ -246,12 +192,10 @@ def fix_page_overflow(out_dir: Path, pdf_path: Path, max_retries: int = 3) -> di
 
 def verify_and_fix_job(out_dir: Path, pdf_path: Path) -> dict:
     """
-    Runs verify_job() first (pure measurement, ground truth). If page count
-    is the problem -- and ONLY page count, since a proofread failure is
-    genuinely corrupted text that a page-trim can't fix -- attempts
-    fix_page_overflow() and then re-runs verify_job() against the
-    recompiled PDF so the final report reflects what's actually on disk
-    now, not the pre-fix state.
+    Runs verify_job() first. If page count is the ONLY problem (a proofread
+    failure is genuine corrupted text that a page-trim can't fix), attempts
+    fix_page_overflow() and re-runs verify_job() so the final report
+    reflects what's actually on disk now.
     """
     report = verify_job(out_dir, pdf_path)
     proofread_ok = report.get("proofread", {}).get("clean", True) is not False

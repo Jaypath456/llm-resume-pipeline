@@ -1,71 +1,3 @@
-#!/usr/bin/env python3
-"""
-Batch resume tailoring pipeline.
-
-For each job description in jobs/*.txt, this script:
-  1. Sends an ISOLATED API call (Prompt A logic) to tailor content -- no chat history, so nothing bleeds between jobs.
-  2. Deterministically links Technical Skills to whichever academic projects
-     got selected for this JD (merge_project_skills-equivalent logic lives in fill_template()).
-  3. Fills your fixed LaTeX template with the tailored content (Prompt B logic).
-  4. Compiles with pdflatex.
-  5. Parses the REAL compile log for Overfull/Underfull hbox warnings -- ground truth, not character-count guessing.
-  6. Measures the REAL rendered PDF text (pdftotext) to check section line counts and sparse last lines --
-     this uses a best-match forward scan that (a) never silently freezes on a bad match and (b) never lets
-     one unmatched chunk corrupt the measurement of every chunk after it.
-  7. If there are layout failures -- INCLUDING real page-count overflow (>1 page), even when every section
-     individually measured within its own line target -- sends a targeted correction call (Prompt C logic)
-     naming only the failing lines/sections, recompiles, up to MAX_LAYOUT_RETRIES times.
-  8. Generates a cover letter (Prompt E logic).
-  9. Writes everything to output/<company>_<role>/, including content.json and jd_text.txt so a later
-     standalone verify_output.py run can reconstruct what to fix without another Gemini call.
-  10. Records a status per job in the manifest: "done" (layout fully verified clean, incl. 1-page + proofread
-      clean) or "needs_review" (something couldn't be confirmed/fixed). needs_review jobs are automatically
-      retried on the next run, up to NEEDS_REVIEW_RETRY_LIMIT times, instead of being silently skipped forever.
-
-NOTE ON WHAT IS AND ISN'T AUTO-FIXED:
-  Section line-count mismatches, sparse orphan last lines, overused verbs, and page-count overflow all get
-  automatically corrected within this loop. A genuine Groq proofread finding (an actual typo/garbled word in
-  the tailored content, as opposed to a pdftotext rendering artifact) is NOT auto-corrected -- it's flagged
-  and marks the job needs_review, but nothing rewrites the bullet. That's deliberate: unlike a line-count
-  target, "is this proofread flag a real typo or a false positive" isn't something to blindly hand back to
-  another model pass without a human glancing at it first.
-
-  ADDITIONALLY (see CHANGELOG below): explicitly-unsupported terms and a code-level narrative-coherence
-  check are now enforced INSIDE the retry loop, not just once before it -- see CHANGELOG for why.
-
-CHANGELOG (guardrail fixes):
-  - FIXED: check_unsupported_terms() / flag_unverified_terms() were only ever called once, immediately
-    after tailor_content() and BEFORE the layout-fix retry loop. Since fix_layout() (Pass C) can rewrite
-    Technical Skills content during any retry, a banned term introduced during a retry was never re-checked
-    against the final compiled content -- the reported "clean" status could silently disagree with what
-    was actually in the PDF. Both checks (plus a new narrative-coherence check) now re-run on every retry
-    iteration, feed into the "is this layout_clean" decision, and are also sent to fix_layout() so the model
-    is told exactly what to remove/rewrite.
-  - ADDED: strip_unsupported_skills() -- Technical Skills is a flat comma-separated list, so a banned term
-    found there is auto-removed deterministically (safe: can't break grammar). A banned term found inside a
-    bullet SENTENCE is not auto-edited (removing a substring from prose can break grammar) -- it's instead
-    surfaced to fix_layout() as a required rewrite, and blocks layout_clean until it's gone.
-  - ADDED: check_narrative_coherence() -- a regex-level backstop for the "one deliverable per bullet" prompt
-    rule, since that rule is currently enforced only by the model reading a paragraph of instructions and
-    already produced one violation ("...processing 10k+ records while maintaining strict software
-    architecture...") that slipped through untouched.
-
-Setup:
-  pip install google-generativeai
-  Set at least GEMINI_API_KEY_1 as an environment variable. GEMINI_API_KEY_2 through _5 are optional --
-  if set, call_gemini() automatically rotates to the next account when one hits its daily free-tier quota
-  (RESOURCE_EXHAUSTED / 429), instead of failing the whole run.
-
-Folder layout expected:
-  ./Master_Resume_Content.md      (your evidence doc)
-  ./Resume_Template.tex           (your fixed template with [BULLET N] placeholders)
-  ./jobs/company_role.txt         (one JD per file, filename becomes the output folder name)
-  ./output/                       (created automatically)
-
-Run:
-  python tailor_resumes.py
-"""
-
 import os
 import re
 import glob
@@ -78,13 +10,6 @@ from verify_output import verify_job, check_page_count
 from google import genai
 import time
 
-# Load API keys from a .env file in the project root, if one exists.
-# This means you no longer need to `export` keys manually every terminal
-# session -- create a .env file (see .env.example) and this picks it up
-# automatically. If python-dotenv isn't installed, or no .env file exists,
-# this silently does nothing and falls back to whatever's already in your
-# real environment variables (e.g. if you still prefer manual export, or
-# have them set in ~/.bashrc).
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -100,8 +25,8 @@ TEMPLATE_PATH = "Resume_Template.tex"
 JOBS_DIR = "jobs"
 OUTPUT_DIR = "output"
 MAX_LAYOUT_RETRIES = 5
-MANIFEST_PATH = ".processed_jobs.json"  # tracks which input .txt files are already done / needs_review
-NEEDS_REVIEW_RETRY_LIMIT = 2  # how many extra runs to re-attempt a needs_review job before leaving it alone
+MANIFEST_PATH = ".processed_jobs.json"
+NEEDS_REVIEW_RETRY_LIMIT = 2
 
 LINE_TARGETS = {
     "Graduate Student Developer": 5,
@@ -112,10 +37,8 @@ LINE_TARGETS = {
     "Technical Skills": 7,
 }
 
-# Full project registry (metadata only -- bullets are always regenerated per
-# JD). The script picks the 3 most JD-relevant of these; header text is
-# assembled deterministically here so the model never has to reproduce
-# exact formatting, only choose relevance and write bullets.
+# Metadata only -- bullets are regenerated per JD. The model picks the 3 most
+# JD-relevant; header text is assembled deterministically here.
 PROJECTS = {
     "lms": {
         "title": "Decoupled Learning Management System (LMS)",
@@ -159,10 +82,8 @@ PROJECTS = {
     },
 }
 
-# Fixed print order for Technical Skills categories -- matches the .tex
-# template's hardcoded item order. Used by BOTH fill_template() (to fill
-# the PDF) and build_measurement_chunks() (to measure it), so the two can
-# never disagree about where each category's text actually appears.
+# Must match the .tex template's hardcoded item order -- used by both
+# fill_template() and build_measurement_chunks() so they never disagree.
 SKILL_CATEGORY_ORDER = [
     "Languages",
     "Frameworks",
@@ -171,11 +92,8 @@ SKILL_CATEGORY_ORDER = [
     "Tools",
 ]
 
-# JD-triggered mandatory skill insertions -- deterministic, not model
-# discretion. Only fires if the JD literally asks for these terms, and only
-# inserts terms that already exist in the master content's Technical
-# Skills pool (added there separately) -- this function never invents new
-# skill tokens, it only forces inclusion of ones already vetted as true.
+# Deterministic JD-triggered skill insertions -- only inserts terms already
+# present in the master content's skill pool, never invents new ones.
 JD_TRIGGERED_SKILLS = {
     "Software Engineering": [
         (r"\balgorithms?\b", "Algorithms"),
@@ -185,13 +103,6 @@ JD_TRIGGERED_SKILLS = {
 
 
 def apply_jd_triggered_skills(jd_text: str, skills: dict) -> dict:
-    """
-    For each category in JD_TRIGGERED_SKILLS, if the JD text matches a
-    trigger pattern and the corresponding skill isn't already present in
-    the model's output for that category, append it. Runs after
-    tailor_content() returns, so it's a deterministic post-processing step,
-    not a prompt instruction the model could skip or paraphrase around.
-    """
     for category, triggers in JD_TRIGGERED_SKILLS.items():
         if category not in skills:
             continue
@@ -205,22 +116,16 @@ def apply_jd_triggered_skills(jd_text: str, skills: dict) -> dict:
 
 def get_project_display_order(selected_pids: list) -> list:
     """
-    SINGLE SOURCE OF TRUTH for the order Academic Projects are printed in.
-    fill_template() uses this to build the PDF; build_measurement_chunks()
-    uses this to know what order to search for bullets in. These two must
-    NEVER compute this sort independently -- academic_projects_selected is
-    the model's RELEVANCE ranking, not the date-sorted order they're
-    actually displayed in, and measure_fill()'s scan is forward-only with
-    no ability to recover from a mismatch. A drift here doesn't raise an
-    error: it makes the scan silently skip past whichever project got
-    scanned over while chasing the next (out-of-order) chunk, and that
-    project's chunks then fail to match on every single retry forever,
-    since the true text is now behind the search pointer.
+    Single source of truth for Academic Projects display order. Must be used
+    by both fill_template() and build_measurement_chunks() -- the model's
+    relevance ranking is not the date-sorted display order, and a mismatch
+    here silently desyncs the forward-only measurement scan.
     """
     return sorted(selected_pids, key=lambda pid: PROJECTS[pid]["sort_key"], reverse=True)
 
 
-# Common resume action verbs to check for document-wide overuse. A verb appearing more than MAX_VERB_REPEAT times across all bullets gets flagged for diversification -- this catches repetition SCATTERED across non-consecutive bullets, which the "avoid same verb in consecutive bullets" content rule alone does not catch.
+# Verbs appearing more than MAX_VERB_REPEAT times across all bullets get
+# flagged, catching repetition scattered across non-consecutive bullets.
 ACTION_VERB_LIST = [
     "built", "automated", "engineered", "developed", "designed", "architected",
     "implemented", "optimized", "created", "streamlined", "collaborated",
@@ -230,17 +135,11 @@ ACTION_VERB_LIST = [
 ]
 MAX_VERB_REPEAT = 2
 
-# Regex-level backstop for the "one deliverable per bullet" narrative-coherence
-# prompt rule. This is a heuristic, not a parser: it will have false positives
-# (a genuine causal "X, which enabled Y" clause can trip the second pattern)
-# and false negatives (a merge phrased without "while" or ", and Xed" slips
-# through). It exists purely because the prompt rule alone is model-obeyed,
-# not enforced, and a real run already produced a violation this catches:
-# "...processing 10k+ records while maintaining strict software architecture
-# and code quality standards through rigorous pull request reviews."
+# Regex-level backstop for the "one deliverable per bullet" prompt rule.
+# Heuristic, not a parser -- will have false positives/negatives.
 NARRATIVE_MERGE_PATTERNS = [
-    r"\bwhile\s+\w+ing\b",     # "...while maintaining...", "...while building..."
-    r",\s*and\s+\w+ed\b",      # ", and built...", ", and mentored..." (2nd past-tense clause)
+    r"\bwhile\s+\w+ing\b",
+    r",\s*and\s+\w+ed\b",
 ]
 
 GRAD_MONTH_YEAR = "December 2026"
@@ -260,12 +159,11 @@ if not gemini_keys:
         "(GEMINI_API_KEY_2..5 optional, for automatic quota failover)."
     )
 gemini_clients = [genai.Client(api_key=k) for k in gemini_keys]
-_active_key_idx = 0  # module-level: which account call_gemini() is currently using
+_active_key_idx = 0
 
 # ---------------------------------------------------------------------------
-# GROQ SETUP -- used for proofread AND for the free-tier-friendly proofread
-# auto-fix pass (see fix_proofread_issues_via_groq below). Falls back to
-# Gemini only if Groq can't resolve an issue after MAX_GROQ_FIX_ATTEMPTS.
+# GROQ SETUP -- proofread + free-tier proofread auto-fix (falls back to
+# Gemini only if Groq can't resolve after MAX_GROQ_FIX_ATTEMPTS).
 # ---------------------------------------------------------------------------
 from groq import Groq
 groq_client = Groq(api_key=os.environ["GROQ_API_KEY"]) if os.environ.get("GROQ_API_KEY") else None
@@ -753,23 +651,11 @@ def force_page_overflow_target(fill_report: dict) -> list:
 # ---------------------------------------------------------------------------
 def check_unsupported_terms(content: dict, master_content: str) -> dict:
     """
-    Hardcoded, code-level enforcement of the "## Explicitly Unsupported"
-    block in Master_Resume_Content.md.
-
-    Returns {"skills_hits": [{"term":..., "category":...}, ...],
-             "bullet_hits": [{"term":..., "location":..., "text":...}, ...]}
-    instead of a flat list, because the two are handled differently
-    downstream: a hit inside Technical Skills (a flat comma-separated list)
-    can be safely auto-removed by strip_unsupported_skills() without
-    damaging grammar. A hit inside a bullet SENTENCE cannot be safely
-    auto-edited by string removal -- it's surfaced as a required rewrite
-    for fix_layout() / a fresh tailor_content() pass instead.
-
-    IMPORTANT: this function itself was verified correct against the
-    "CI/CD (no direct evidence...)" case -- the original bug was NOT here,
-    it was that process_job() only ever called this once, before the
-    layout-fix retry loop, so a term introduced by a later fix_layout()
-    pass was never checked. See process_job() and the module CHANGELOG.
+    Code-level enforcement of the "## Explicitly Unsupported" block in
+    Master_Resume_Content.md. Returns skills_hits (auto-strippable, since
+    Technical Skills is a flat comma list) separately from bullet_hits
+    (not auto-edited, since removing a substring from prose can break
+    grammar -- surfaced to fix_layout() as a required rewrite instead).
     """
     match = re.search(
         r"## Explicitly Unsupported(.*?)(?=\n## |\Z)", master_content, re.DOTALL
@@ -788,12 +674,9 @@ def check_unsupported_terms(content: dict, master_content: str) -> dict:
             continue
         if term.lower().startswith(("note", "explicitly", "never", "unsupported")):
             continue
-        # A blocked term is always a short token/phrase from a comma list.
-        # Anything longer than ~4 words is a run-on sentence fragment that
-        # leaked through the comma/newline split (e.g. a wrapped NOTE
-        # sentence, or the "---" divider) -- never a real blocked term, and
-        # letting it through just wastes a regex search or, worse, could
-        # accidentally match unrelated prose.
+        # A real blocked term is a short comma-list token; anything longer
+        # is a run-on fragment (wrapped NOTE sentence, "---" divider, etc.)
+        # that leaked through the split.
         if len(term.split()) > 4:
             continue
         blocked_terms.append(term)
@@ -833,13 +716,9 @@ def check_unsupported_terms(content: dict, master_content: str) -> dict:
 
 def strip_unsupported_skills(content: dict, skills_hits: list) -> dict:
     """
-    Deterministically removes banned terms found in Technical Skills.
-    Safe to do mechanically because skills is a flat comma-separated list --
-    unlike a bullet sentence, dropping one item can't break grammar or leave
-    a dangling clause. Runs IN-PLACE on content["skills"] and also returns
-    it for convenience. Bullet-level hits are intentionally NOT auto-edited
-    here (see check_unsupported_terms docstring) -- the caller must route
-    those to fix_layout() or treat them as a hard needs_review instead.
+    Deterministically removes banned terms from Technical Skills. Safe
+    mechanically since it's a flat comma-separated list. Bullet-level hits
+    are intentionally not auto-edited here -- see check_unsupported_terms.
     """
     for hit in skills_hits:
         category, term = hit["category"], hit["term"]
@@ -854,13 +733,9 @@ def strip_unsupported_skills(content: dict, skills_hits: list) -> dict:
 
 def check_narrative_coherence(content: dict) -> list:
     """
-    Regex-level backstop for the "one deliverable per bullet" prompt rule
-    (see NARRATIVE_MERGE_PATTERNS module constant for why this is a
-    heuristic, not a parser, and will have both false positives and false
-    negatives). Returns a list of hits to feed into fix_layout() and into
-    the layout_clean determination -- never auto-edits a bullet itself,
-    since splitting a merged sentence back into "pick one deliverable"
-    is a judgment call, not a mechanical string operation.
+    Regex-level backstop for the "one deliverable per bullet" prompt rule.
+    Heuristic, not a parser -- never auto-edits, just feeds fix_layout()
+    and the layout_clean determination.
     """
     hits = []
     bullet_sources = []
@@ -880,12 +755,10 @@ def check_narrative_coherence(content: dict) -> list:
 
 def locate_proofread_snippet(snippet: str, content: dict):
     """
-    Maps a Groq-flagged snippet back to the exact bullet it came from in
-    content.json, so a fix call can target just that one bullet instead of
-    guessing. Uses substring/word-overlap matching, not exact match,
-    because pdftotext line-wrapping can shift whitespace slightly from the
-    source JSON text. Returns None if no bullet can be confidently
-    matched -- that issue is then left for manual review instead of guessed at.
+    Maps a Groq-flagged snippet back to its source bullet in content.json.
+    Uses substring/word-overlap matching (not exact match) since pdftotext
+    line-wrapping can shift whitespace. Returns None if no confident match,
+    leaving that issue for manual review.
     """
     def norm(s):
         return re.sub(r"\s+", " ", s.lower()).strip()
@@ -915,32 +788,20 @@ def locate_proofread_snippet(snippet: str, content: dict):
     
 def split_skill_terms(value: str) -> list:
     """
-    Splits a Technical Skills comma-separated string into individual terms,
-    while treating a parenthetical group like "Graph Neural Networks
-    (GraphSAGE, GAT)" as ONE term rather than splitting on the comma
-    inside the parentheses. A naive value.split(",") mangles that into two
-    broken fragments -- "Graph Neural Networks (GraphSAGE" and " GAT)" --
-    and the first fragment then fails the unverified-term check (it's not
-    a real phrase, it's a parsing artifact) and gets silently stripped,
-    deleting legitimate, verified content along with it. Confirmed real
-    case: this exact fragment appeared in a live run and cost 2 lines of
-    Technical Skills that the retry loop then couldn't recover.
+    Splits Technical Skills on commas, treating a parenthetical group like
+    "Graph Neural Networks (GraphSAGE, GAT)" as one term rather than
+    splitting inside the parentheses.
     """
     parts = re.split(r',\s*(?![^(]*\))', value)
     return [p.strip() for p in parts if p.strip()]
     
 def flag_unverified_terms(content: dict, master_content: str) -> list:
     """
-    Heuristic: flags Technical Skills terms with no basis anywhere in
-    master_content. Checks each comma-separated sub-term individually and
-    normalizes case/whitespace/punctuation before comparing. Also does a
-    light suffix-fold (plurals, "-ing"/"-ed"/"-ical"/"-ization" endings) on
-    the WORD-LEVEL fallback check, so a phrasing difference like "Dynamic
-    SQL Querying" (output) vs. "dynamic queries" (master) or "Relational
-    Database Design" vs. "relational databases" doesn't get flagged as
-    unverified just because the exact inflection differs -- a genuinely new
-    term like "CI/CD Pipelines" still won't have all its stemmed words
-    present, so it still gets flagged correctly.
+    Flags Technical Skills terms with no basis in master_content. Checks
+    each sub-term individually, normalized, with a light suffix-fold
+    (plurals, -ing/-ed/-ical/-ization) so a phrasing difference like
+    "Dynamic SQL Querying" vs. "dynamic queries" isn't falsely flagged,
+    while a genuinely new term still is.
     """
     def normalize(s: str) -> str:
         s = s.lower()
@@ -955,12 +816,9 @@ def flag_unverified_terms(content: dict, master_content: str) -> list:
         return word
 
     master_norm = normalize(master_content)
-    # Sub-phrase scoped, not just line-scoped. Master content lines are
-    # frequently comma-separated tech lists, and a bag-of-words match
-    # across the WHOLE line lets two unrelated list items combine into a
-    # claim that was never made. Splitting on commas/semicolons too, and
-    # requiring all term words to co-occur within the SAME sub-phrase,
-    # closes that gap.
+    # Sub-phrase scoped (split on commas/semicolons too), not just
+    # line-scoped, so two unrelated list items on the same line can't
+    # combine into a claim that was never made.
     raw_subphrases = re.split(r"[\n,;]", master_content)
     master_lines_norm = [normalize(p) for p in raw_subphrases if p.strip()]
     master_line_stems = [set(line.split()) for line in master_lines_norm]
@@ -977,11 +835,9 @@ def flag_unverified_terms(content: dict, master_content: str) -> list:
             bare_norm = normalize(bare)
             if bare_norm in master_norm:
                 continue
-            # NEW: if the output expands an abbreviation that master content
-            # only ever states in short form (e.g. output "Object-Oriented
-            # Programming (OOP)" where master content just says "OOP"),
-            # the parenthetical abbreviation IS the verified claim -- don't
-            # flag the expanded label as unverified.
+            # If the output expands an abbreviation the master content only
+            # states in short form, the abbreviation itself is the verified
+            # claim -- don't flag the expanded label.
             if paren_match:
                 abbrev_norm = normalize(paren_match.group(1))
                 if abbrev_norm and re.search(r"\b" + re.escape(abbrev_norm) + r"\b", master_norm):
@@ -1178,12 +1034,9 @@ no markdown, no leading bullet character, no commentary.
 
 def fix_proofread_issues(content: dict, issues: list, master_content: str, use_groq: bool = True):
     """
-    Applies a surgical single-bullet fix to every located Groq finding, in
-    place. use_groq=True (default) uses the free-tier Groq call;
-    use_groq=False uses Gemini, reserved as the fallback when Groq's fix
-    doesn't hold up after MAX_GROQ_FIX_ATTEMPTS. Returns (content,
-    unresolved) -- unresolved holds any issue whose source bullet couldn't
-    be confidently located, left untouched rather than guessed at.
+    Applies a surgical fix to every located Groq finding, in place.
+    Returns (content, unresolved) -- unresolved holds issues whose source
+    bullet couldn't be confidently located.
     """
     unresolved = []
     fixer = groq_fix_bullet if use_groq else gemini_fix_bullet
@@ -1201,8 +1054,6 @@ def fix_proofread_issues(content: dict, issues: list, master_content: str, use_g
         print(f"  -> [{engine_label}] fixing proofread issue in {located['location']}: {problem}")
         fixed_text = fixer(located["text"], problem, master_content)
         if located["kind"] == "skills":
-            # Skills categories are a flat string, not a list of bullets --
-            # no index to assign into, just overwrite the whole category.
             content["skills"][located["key"]] = fixed_text
         else:
             content[located["kind"]][located["key"]][located["index"]] = fixed_text
@@ -1327,9 +1178,6 @@ def process_job(jd_path: Path, master_content: str, template: str):
     content = tailor_content(jd_text, master_content)
     content["skills"] = apply_jd_triggered_skills(jd_text, content["skills"])
 
-    # Early guardrail pass, right after generation and before the first
-    # compile: strip any banned term that landed in Technical Skills so the
-    # VERY FIRST compiled PDF is already clean.
     unsupported = check_unsupported_terms(content, master_content)
     if unsupported["skills_hits"]:
         content = strip_unsupported_skills(content, unsupported["skills_hits"])
@@ -1392,8 +1240,6 @@ def process_job(jd_path: Path, master_content: str, template: str):
         sparse = fill_report["sparse_bullets"]
         verb_report = check_verb_repetition(content)
 
-        # Re-run unsupported/unverified/narrative checks on EVERY retry,
-        # because fix_layout() can rewrite Technical Skills and bullets.
         unsupported = check_unsupported_terms(content, master_content)
         if unsupported["skills_hits"]:
             print(f"  -> auto-stripping banned term(s) from Technical Skills: "
@@ -1411,9 +1257,6 @@ def process_job(jd_path: Path, master_content: str, template: str):
 
         narrative_issues = check_narrative_coherence(content)
 
-        # The checks above can modify Technical Skills. If they did, the
-        # current PDF no longer exactly matches content.json, so force a
-        # recompile on this iteration rather than declaring the PDF clean.
         if skills_were_stripped:
             (out_dir / "content.json").write_text(json.dumps(content, indent=2))
 
@@ -1468,15 +1311,9 @@ def process_job(jd_path: Path, master_content: str, template: str):
                   "recompiling with corrected skills, skipping Gemini fix_layout() call.")
             continue
 
-        # QUOTA GUARD: if fix_layout() already told us on a PRIOR attempt
-        # that a chunk can't be fixed without inventing an unverified term
-        # or cutting a real metric ("flagged"), and that same chunk is
-        # STILL the only thing wrong, asking again just spends another
-        # Gemini call to get the same honest "can't do this" answer. Stop
-        # here and accept the minor cosmetic imperfection instead --
-        # confirmed real case: 'skill_Artificial Intelligence & Machine
-        # Learning' got flagged on attempt 3 and then re-asked (for free,
-        # on the free tier) on attempts 4, 5, AND 6 with zero change.
+        # If a chunk was already flagged unfixable on a prior attempt and
+        # is STILL the only thing wrong, re-asking just spends another
+        # Gemini call for the same answer -- accept it as-is instead.
         previously_flagged = set(content.get("flagged", []))
         remaining_issue_ids = (
             {s["chunk_id"] for s in sparse}
@@ -1485,14 +1322,8 @@ def process_job(jd_path: Path, master_content: str, template: str):
         )
         still_stuck_on_flagged = previously_flagged & remaining_issue_ids
 
-        # Only skip the Gemini call if the previously-flagged chunk(s) are
-        # the ENTIRE remaining problem -- not just A problem. Confirmed
-        # regression: this used to fire even while OTHER unrelated, fully
-        # fixable issues were still open (a real 'built' x3 verb-repeat
-        # violation, and 3 sections genuinely short of their line target),
-        # silently discarding fixable problems along with the one
-        # legitimately-unfixable chunk. Now requires the flagged chunk(s)
-        # to account for ALL open issues before skipping.
+        # Only skip the Gemini call if the flagged chunk(s) account for
+        # ALL remaining issues -- not just one of several.
         only_issue_is_previously_flagged = (
             still_stuck_on_flagged
             and remaining_issue_ids <= previously_flagged
@@ -1520,7 +1351,7 @@ def process_job(jd_path: Path, master_content: str, template: str):
     content_path = out_dir / "content.json"
     content_path.write_text(json.dumps(content, indent=2))
 
-    # FINAL, AUTHORITATIVE guardrail check against the actual final content.
+    # Final, authoritative guardrail check against the actual final content.
     final_unsupported = check_unsupported_terms(content, master_content)
     final_unverified_terms = flag_unverified_terms(content, master_content)
     final_narrative_issues = check_narrative_coherence(content)
@@ -1566,15 +1397,10 @@ def process_job(jd_path: Path, master_content: str, template: str):
         if verification.get("proofread") and not verification["proofread"].get("clean", True):
             issues = verification["proofread"]["issues"]
 
-            # CIRCUIT BREAKER: if most/all flagged issues share near-identical
-            # wording about a garbled/garbage/bullet character, this is almost
-            # certainly a systemic PDF-extraction artifact (a new, still-
-            # unstripped font-rendering codepoint), not per-bullet content
-            # damage. Rewriting bullet text can NEVER fix a character inserted
-            # at compile time by \item itself -- confirmed by a real run that
-            # burned 3 Gemini accounts trying anyway. Skip the auto-fix loop
-            # entirely and flag it for a human to add the new codepoint to
-            # extract_text()'s strip regex instead of wasting API calls.
+            # If most flagged issues share near-identical wording about a
+            # garbled/bullet character, it's almost certainly a systemic
+            # PDF-extraction artifact, not per-bullet content damage --
+            # rewriting bullet text can't fix a compile-time character.
             rendering_artifact_signal = sum(
                 1 for i in issues
                 if re.search(r"garbage|bullet point|replacement symbol|non-standard",
