@@ -1,3 +1,12 @@
-google-genai
-groq
-python-dotenv
+# Runtime
+openpyxl          # reads Resume_analysis.xlsx (the tailoring policy source)
+python-dotenv     # loads GEMINI_API_KEY_n / GROQ_API_KEY from .env
+google-genai      # Gemini transport (project selection, bullets, repair)
+groq              # Groq transport (cover letter, assessment)
+
+# Testing
+pytest
+
+# System tools required at runtime (not pip-installable):
+#   pdflatex   - TeX Live / MiKTeX
+#   pdftotext  - poppler-utils (needs -bbox-layout support)

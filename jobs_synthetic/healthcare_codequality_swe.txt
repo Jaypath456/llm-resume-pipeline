@@ -1,0 +1,22 @@
+Company: Meridian Health Systems
+Job Title: Senior Software Engineer - Clinical Platform
+Job ID: MHS-9001
+
+Meridian Health Systems builds clinical software used by clinicians to manage patient
+records and deliver remote care to patients at home.
+
+Responsibilities:
+- Build backend services for clinical and patient-facing workflows using Python and Django.
+- Work with relational databases containing healthcare records and clinical audit trails.
+- Review pull requests and give other engineers actionable, specific feedback.
+- Maintain code quality through peer review and testing across the clinical platform.
+- Own the quality bar for the patient-records codebase.
+- Integrate telemedicine video consultation and clinical report generation features.
+- Work directly with clinicians and product stakeholders on workflow requirements.
+
+Requirements:
+- Python, Django, REST APIs, SQL, and PostgreSQL.
+- Strong code-review skills on a multi-person engineering team.
+- Experience building healthcare, telemedicine, or clinical workflow software.
+- Familiarity with WebSockets, Redis, WebRTC, or AWS is a plus.
+- Experience with HIPAA, FHIR, or EHR integrations is preferred but not required.

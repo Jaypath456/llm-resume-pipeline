@@ -1,0 +1,18 @@
+Company: Bramble Software
+Job Title: Junior Software Engineer
+Job ID: BR-4408
+
+Bramble Software is hiring a Junior Software Engineer for our backend team.
+
+Responsibilities:
+- Build backend applications and REST APIs using Python.
+- Design relational database schemas and write efficient SQL queries.
+- Develop real-time services using WebSockets and Redis caching.
+- Containerize applications with Docker and maintain consistent environments.
+- Work with engineers on testing and debugging production issues.
+
+Requirements:
+- This is an entry level role suitable for early career engineers.
+- 0-2 years of professional software engineering experience.
+- Bachelor's degree in Computer Science required; Master's preferred.
+- Python, Django, PostgreSQL, REST APIs, Docker, Linux, and Git.

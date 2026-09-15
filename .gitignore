@@ -4,11 +4,18 @@
 
 # Personal data -- never commit your real resume content or generated output
 Master_Resume_Content.md
+Master_Resume_Context.md
+Resume_analysis.xlsx
 jobs/
 output/
+processed_jobs.csv
+.processed_index.json
+
+# Legacy state from the previous pipeline (kept locally, not authoritative)
 .processed_jobs.json
 
 # Python
+.pytest_cache/
 .venv/
 venv/
 __pycache__/

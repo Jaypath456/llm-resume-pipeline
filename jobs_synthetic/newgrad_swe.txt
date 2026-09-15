@@ -1,0 +1,24 @@
+Company: Lumenpath Technologies
+Job Title: Software Engineer, New Grad 2027
+Job ID: LP-NG-2027
+
+Lumenpath Technologies is hiring through our university recruiting program for
+engineers joining our backend platform team.
+
+Eligibility:
+- This is a new graduate role. Candidates must be graduating between December 2026
+  and June 2027.
+- Open to the class of 2027.
+
+Responsibilities:
+- Build backend services and REST APIs using Python.
+- Design relational database schemas and write efficient SQL queries.
+- Develop real-time features using WebSockets and caching with Redis.
+- Containerize applications and keep development and deployment environments consistent.
+- Work with teammates on testing and debugging.
+
+Requirements:
+- Strong Python programming skills.
+- Experience with Django or another Python web framework.
+- PostgreSQL or MySQL, REST API development, Docker, Linux, and Git.
+- Coursework or internship experience in software engineering.
