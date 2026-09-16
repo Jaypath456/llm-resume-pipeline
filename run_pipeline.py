@@ -185,11 +185,92 @@ def load_index(index_path: Path) -> dict:
             f"Reconcile it before running.")
     return data
 
+# Where a stale index reference is parked for a human to reconcile. Append
+# only: the tracking record itself is never rewritten by this path.
+RECONCILE_PATH = engine.PROJECT_ROOT / ".tracking_reconcile.json"
+
+# Outcome states. Only "recorded" means the tracking contract was satisfied;
+# "stale_reference" and "aborted" are failures that must reach the status line
+# rather than being swallowed behind a clean SUCCESS.
+TRACKING_OK = "recorded"
+TRACKING_SKIPPED = "skipped"
+TRACKING_IDEMPOTENT = "idempotent"
+TRACKING_STALE = "stale_reference"
+TRACKING_ABORTED = "aborted"
+TRACKING_FAILURES = (TRACKING_STALE, TRACKING_ABORTED)
+
+
+@dataclass
+class TrackingOutcome:
+    """What tracking actually did, so the caller can tell the difference.
+
+    Truthy exactly when the application was recorded, so existing callers that
+    treat this as a boolean keep working.
+    """
+
+    state: str
+    detail: str = ""
+
+    def __bool__(self) -> bool:
+        return self.state == TRACKING_OK
+
+    @property
+    def failed(self) -> bool:
+        return self.state in TRACKING_FAILURES
+
+
+def park_stale_reference(fingerprint: str, stale_folder: str, jd, run_dir: Path,
+                         log: StageLog, path: Path | None = None) -> Path:
+    """Record enough to identify and repair a stale index entry.
+
+    Written beside the tracking files, APPENDING to whatever is already there.
+    Nothing in processed_jobs.csv or .processed_index.json is touched: the
+    previous record and its history survive exactly as they were, and a human
+    (or a later reconciliation task) decides what the truth is.
+    """
+    target = path or RECONCILE_PATH
+    entries = []
+    if target.exists():
+        try:
+            loaded = json.loads(target.read_text(encoding="utf-8"))
+            entries = loaded if isinstance(loaded, list) else [loaded]
+        except (OSError, json.JSONDecodeError):
+            # A damaged reconciliation file must not cost us this diagnosis.
+            log.warning("could not read %s; starting a fresh reconciliation list",
+                        target.name)
+            entries = []
+    entry = {
+        "fingerprint": fingerprint,
+        "indexed_run_folder": stale_folder,
+        "indexed_folder_exists": False,
+        "current_run_folder": run_dir.name,
+        "company_name": jd.company_name,
+        "job_title": jd.job_title,
+        "job_id": jd.job_id,
+        "source_file": jd.source_file,
+        "detected_at": datetime.now().isoformat(timespec="seconds"),
+        "state": TRACKING_STALE,
+        "resolution": "unresolved",
+        "note": ("the index points at a run folder that no longer exists; tracking was "
+                 "NOT written and no application record was invented"),
+    }
+    if not any(e.get("fingerprint") == fingerprint
+               and e.get("current_run_folder") == run_dir.name for e in entries):
+        entries.append(entry)
+    write_json_atomic(target, entries)
+    return target
+
+
 
 class Tracker:
     """Appends a production application to processed_jobs.csv, once."""
 
-    def __init__(self, csv_path: Path, index_path: Path, enabled: bool = True):
+    def __init__(self, csv_path: Path, index_path: Path, enabled: bool = True,
+                 reconcile_path: Path | None = None):
+        # Beside the index by default, so a test never writes the real one.
+        self.reconcile_path = reconcile_path or (
+            index_path.with_name(".tracking_reconcile.json")
+            if index_path != engine.PROCESSED_INDEX else RECONCILE_PATH)
         self.csv_path = csv_path
         self.index_path = index_path
         self.enabled = enabled
@@ -204,24 +285,26 @@ class Tracker:
     def missing_artifacts(self, run_dir: Path) -> list[str]:
         return [name for name in REQUIRED_ARTIFACTS if not (run_dir / name).exists()]
 
-    def record(self, jd: engine.JobPosting, run_dir: Path, status: str, log: StageLog) -> bool:
+    def record(self, jd: engine.JobPosting, run_dir: Path, status: str,
+               log: StageLog) -> TrackingOutcome:
         if not self.enabled:
             log.info("tracking skipped: this is a mock/smoke run, production tracking "
                      "files are never opened")
-            return False
+            return TrackingOutcome(TRACKING_SKIPPED, "mock or smoke run")
         if status != "success":
             log.info("tracking skipped: status=%s (only a verified success is recorded)", status)
-            return False
+            return TrackingOutcome(TRACKING_SKIPPED, f"status={status}")
         missing = self.missing_artifacts(run_dir)
         if missing:
             log.warning("tracking skipped: missing required artifact(s) %s", ", ".join(missing))
-            return False
+            return TrackingOutcome(TRACKING_SKIPPED,
+                                   "missing artifacts: " + ", ".join(missing))
 
         try:
             index = load_index(self.index_path)
         except TrackingStateError as error:
             log.error("tracking aborted: %s", error)
-            return False
+            return TrackingOutcome(TRACKING_ABORTED, str(error))
 
         # Idempotence: an explicit rerun of an already-recorded fingerprint must
         # not append a second CSV row or repoint the index.
@@ -232,11 +315,21 @@ class Tracker:
                 log.info("tracking idempotent: fingerprint already recorded against run "
                          "folder %s; no CSV row appended and the index is unchanged",
                          folder)
-                return False
+                return TrackingOutcome(TRACKING_IDEMPOTENT,
+                                       f"already recorded against {folder}")
+            # The existing record is preserved untouched - overwriting it would
+            # destroy the only evidence of the earlier application. The stale
+            # reference is parked with enough metadata to repair it.
+            parked = park_stale_reference(jd.fingerprint, folder, jd, run_dir, log,
+                                          path=self.reconcile_path)
             log.error("tracking STOPPED: fingerprint %s is recorded against run folder "
-                      "%r, which no longer exists. Not guessing a reconciliation; report "
-                      "this state before recording.", jd.fingerprint[:12], folder)
-            return False
+                      "%r, which no longer exists. The existing record is UNCHANGED and "
+                      "no application row was invented; the stale reference is parked in "
+                      "%s for reconciliation.", jd.fingerprint[:12], folder, parked.name)
+            return TrackingOutcome(
+                TRACKING_STALE,
+                f"fingerprint {jd.fingerprint[:12]} points at missing run folder "
+                f"{folder!r}; parked in {parked.name}")
 
         # The index is the authority for skip decisions, so commit it FIRST and
         # atomically. The CSV is a human-readable log written only afterwards.
@@ -274,11 +367,11 @@ class Tracker:
             log.error("%s committed, but appending the human log %s failed (%s). The skip "
                       "source is safe; no rollback performed.",
                       self.index_path.name, self.csv_path.name, error)
-            return True
+            return TrackingOutcome(TRACKING_OK, f"index committed; CSV append failed: {error}")
 
         log.info("recorded in %s and %s (index committed first)",
                  self.index_path.name, self.csv_path.name)
-        return True
+        return TrackingOutcome(TRACKING_OK)
 
 
 # =================================================================== result
@@ -293,6 +386,9 @@ class RunResult:
     strategy: dict = field(default_factory=dict)
     assessment: dict = field(default_factory=dict)
     pdf_path: Path | None = None
+    # What tracking did: recorded / skipped / idempotent / stale_reference /
+    # aborted. Only "recorded" means the application is logged as submitted.
+    tracking: str = ""
 
 
 def sanitize(value: str) -> str:
@@ -1476,7 +1572,17 @@ def run_one(jd_path: Path, *, mock: bool, smoke: bool, console: bool = True) -> 
             if final_pdf:
                 result.pdf_path = final_pdf
         tracker = Tracker(engine.PROCESSED_CSV, engine.PROCESSED_INDEX, enabled=not isolated)
-        tracker.record(jd, run_dir, status, log.stage_log("TRACKING"))
+        tracking = tracker.record(jd, run_dir, status, log.stage_log("TRACKING"))
+        result.tracking = tracking.state
+        if tracking.failed and status == "success":
+            # The artifacts are verified and kept, but the application was NOT
+            # recorded, so this must not read as an ordinary clean success: the
+            # posting would look unprocessed to the next batch run.
+            status = "success_with_tracking_warning"
+            result.status = status
+            issues.append(f"tracking not persisted ({tracking.state}): {tracking.detail}")
+            final.error("artifacts are complete and verified, but TRACKING FAILED: %s. "
+                        "The application is NOT recorded as submitted.", tracking.detail)
         provider_summary = ", ".join(
             f"{c.purpose}:{'accepted' if c.accepted else 'rejected'}"
             for c in client.calls) or "none"
@@ -2238,9 +2344,14 @@ def run_batch(folder: Path, *, mock: bool = False, smoke: bool = False,
     for result in results:
         counts[result.status] = counts.get(result.status, 0) + 1
     print("[BATCH] complete")
+    warned = counts.get("success_with_tracking_warning", 0)
     print(f"  successes: {counts.get('success', 0)}")
+    if warned:
+        # Artifacts are complete, tracking is not: these postings will look
+        # unprocessed to the next batch run until they are reconciled.
+        print(f"  success_with_tracking_warning: {warned}")
     print(f"  needs_review: {counts.get('needs_review', 0)}")
-    print(f"  failed: {sum(n for s, n in counts.items() if s not in ('success', 'needs_review'))}")
+    print(f"  failed: {sum(n for s, n in counts.items() if s not in ('success', 'needs_review', 'success_with_tracking_warning'))}")
     print(f"  skipped: {len(skipped)}")
     for result in results:
         print(f"  {result.status:12s} {result.jd_path.name:34s} "

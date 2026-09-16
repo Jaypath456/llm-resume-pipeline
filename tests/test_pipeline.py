@@ -1717,7 +1717,7 @@ def test_needs_review_is_never_marked_processed(tmp_path):
     run_dir.mkdir()
     log = run_pipeline.StageLog(logging.getLogger("test-batch"), "TEST")
     for status in ("needs_review", "failed"):
-        assert tracker.record(jd, run_dir, status, log) is False
+        assert bool(tracker.record(jd, run_dir, status, log)) is False
     assert json.loads((tmp_path / "index.json").read_text()) == {}
     pending, skipped = run_pipeline.discover_jobs(tmp_path, tracker)
     assert [p.name for p in pending] == ["retry.txt"]
@@ -2399,12 +2399,20 @@ def _letter_body(transactions: str) -> str:
         "Sincerely,\nJay Niketan Pathare\n")
 
 
-def _letter_call(client, run, bae):
+def _letter_call(client, run, bae, capsules=None):
+    """The shared letter call. `capsules` stays EMPTY by default.
+
+    Source-scope validation only runs when capsules are supplied, and the
+    shared `_letter_body` fixture deliberately draws on two sources, so tests
+    that are about metrics or transports must not switch scoping on. Tests
+    that need the qualified-numbers block pass capsules explicitly.
+    """
+    master = run["master"]
     return client.cover_letter(
         bae["jd"], run["signals"],
         ["Built a fuzzy-matching combinator engine to merge asynchronous JSON outputs."],
-        [run["master"].project("fraud")],
-        themes=engine.jd_themes(bae["requirements"], 4))
+        [master.project("fraud")],
+        themes=engine.jd_themes(bae["requirements"], 4), capsules=capsules or {})
 
 
 def test_cover_letter_repairs_an_inexact_metric_on_retry(run, bae):
@@ -2579,7 +2587,7 @@ def test_tracking_is_idempotent_for_an_already_recorded_fingerprint(tmp_path, mo
                                                                     bae):
     tracker, run_dir = _tracker_env(tmp_path, monkeypatch)
     jd = bae["jd"]
-    assert tracker.record(jd, run_dir, "success", _stage_log()) is True
+    assert bool(tracker.record(jd, run_dir, "success", _stage_log())) is True
 
     index = json.loads((tmp_path / "index.json").read_text())
     assert list(index) == [jd.fingerprint]
@@ -2592,7 +2600,7 @@ def test_tracking_is_idempotent_for_an_already_recorded_fingerprint(tmp_path, mo
     other.mkdir()
     for name in run_pipeline.REQUIRED_ARTIFACTS:
         (other / name).write_text("x")
-    assert tracker.record(jd, other, "success", _stage_log()) is False
+    assert bool(tracker.record(jd, other, "success", _stage_log())) is False
 
     assert json.loads((tmp_path / "index.json").read_text()) == index
     assert index[jd.fingerprint]["run_folder"] == run_dir.name
@@ -2605,7 +2613,7 @@ def test_tracking_stops_when_the_indexed_run_folder_is_missing(tmp_path, monkeyp
     (tmp_path / "index.json").write_text(json.dumps(
         {bae["jd"].fingerprint: {"run_folder": "Vanished_Folder_2026-09-14",
                                  "source_file": "bae.txt"}}))
-    assert tracker.record(bae["jd"], run_dir, "success", _stage_log()) is False
+    assert bool(tracker.record(bae["jd"], run_dir, "success", _stage_log())) is False
     # nothing invented, nothing written
     assert "Vanished_Folder_2026-09-14" in (tmp_path / "index.json").read_text()
     assert not (tmp_path / "processed.csv").exists()
@@ -2619,7 +2627,7 @@ def test_index_failure_leaves_the_csv_untouched(tmp_path, monkeypatch, bae):
         raise OSError("simulated index write failure")
 
     monkeypatch.setattr(run_pipeline.os, "replace", explode)
-    assert tracker.record(bae["jd"], run_dir, "success", _stage_log()) is False
+    assert bool(tracker.record(bae["jd"], run_dir, "success", _stage_log())) is False
     assert not (tmp_path / "index.json").exists()
     assert not (tmp_path / "processed.csv").exists()
     assert not list(tmp_path.glob("index.json.tmp"))
@@ -2630,7 +2638,7 @@ def test_csv_failure_after_a_committed_index_is_not_rolled_back(tmp_path, monkey
     tracker, run_dir = _tracker_env(tmp_path, monkeypatch)
     # make the CSV path un-appendable by turning it into a directory
     (tmp_path / "processed.csv").mkdir()
-    assert tracker.record(bae["jd"], run_dir, "success", _stage_log()) is True
+    assert bool(tracker.record(bae["jd"], run_dir, "success", _stage_log())) is True
     index = json.loads((tmp_path / "index.json").read_text())
     assert index[bae["jd"].fingerprint]["run_folder"] == run_dir.name
 
@@ -2780,7 +2788,7 @@ def test_a_corrupt_index_blocks_discovery_and_recording(tmp_path, monkeypatch, b
     for name in run_pipeline.REQUIRED_ARTIFACTS:
         (run_dir / name).write_text("x")
     # record() reports the corruption and writes nothing
-    assert tracker.record(bae["jd"], run_dir, "success", _stage_log()) is False
+    assert bool(tracker.record(bae["jd"], run_dir, "success", _stage_log())) is False
     assert not (tmp_path / "processed.csv").exists()
     assert index.read_text() == ""
 
@@ -3632,7 +3640,12 @@ def test_c_ignoring_customer_facing_evidence_costs_relevance_and_score():
     assert bad and bad[0].kind == "relevance"
     assert bad[0].severity == "warning", "a true letter is never rejected for this"
     assert "customer-facing delivery" in bad[0].message
-    assert good == []
+    # The well-prioritized letter covers priority 1. C3 has more than one
+    # supported priority, so the breadth rule now asks for the second too -
+    # still a warning, and still about WHICH evidence, never about truth.
+    assert all(p.severity == "warning" for p in good)
+    assert not any("does not use the strongest supported evidence" in p.message
+                   for p in good), "priority 1 is covered"
 
     common = dict(problems=[], priorities=priorities, themes_covered=2,
                   evidence_sources=2, named_terms_covered=2,
@@ -3693,8 +3706,13 @@ def test_d_superhuman_primary_priority_is_ai_native_development():
 
 def test_d_ai_native_evidence_outranks_an_equally_grounded_backend_letter():
     priorities = _priorities_for(REDWOOD_JD, _SUPERHUMAN_CHOSEN)
-    assert grounding.letter_relevance(_SUPERHUMAN_AI_NATIVE, priorities) == []
-    assert grounding.letter_relevance(_SUPERHUMAN_BACKEND_ONLY, priorities)
+    # The AI-native letter covers priority 1; the backend-only one does not.
+    ai_problems = grounding.letter_relevance(_SUPERHUMAN_AI_NATIVE, priorities)
+    assert not any("does not use the strongest supported evidence" in p.message
+                   for p in ai_problems)
+    backend_problems = grounding.letter_relevance(_SUPERHUMAN_BACKEND_ONLY, priorities)
+    assert any("does not use the strongest supported evidence" in p.message
+               for p in backend_problems)
 
     common = dict(problems=[], priorities=priorities, themes_covered=2,
                   evidence_sources=2, named_terms_covered=1,
@@ -3784,7 +3802,14 @@ def test_f_missing_jd_keywords_alone_is_not_a_relevance_failure():
               "meetings, built prototypes to validate scope and owned delivery end to "
               "end.\n\nSincerely,\nJay Niketan Pathare")
     assert grounding.letter_named_terms(letter, ["Kubernetes", "Terraform", "Go"]) == []
-    assert grounding.letter_relevance(letter, priorities) == []
+    # Priority 1 is addressed, so no "wrong evidence" warning. A breadth
+    # warning may remain, but it names the SECOND priority - never a keyword.
+    problems = grounding.letter_relevance(letter, priorities)
+    assert not any("does not use the strongest supported evidence" in p.message
+                   for p in problems)
+    for problem in problems:
+        assert "priority 2 is still missing" in problem.message, problem.message
+        assert problem.severity == "warning"
 
 
 def test_f_relevance_is_advisory_and_generation_validation_is_untouched():
@@ -5683,8 +5708,8 @@ def test_the_workers_receive_copies_not_the_live_structures(run, c3):
 
 def test_strategy_json_is_written_exactly_once_per_run():
     source = Path(run_pipeline.__file__).read_text(encoding="utf-8")
-    # One write in the generation path, one in --assess, both atomic.
-    assert source.count("write_json_atomic(") == 3      # definition + 2 call sites
+    # Call sites: the generation path, --assess, and the stale-reference park.
+    assert source.count("write_json_atomic(") == 4      # definition + 3 call sites
     assert 'strategy_path.write_text' not in source
     assert 'json.dumps(strategy' not in source
     for block_name in ("def run_one(", "def assess_run("):
@@ -6484,7 +6509,7 @@ def test_parallelism_and_the_single_writer_are_untouched():
     code = _code_only(block)
     for forbidden in ("write_text", "write_json_atomic", "json.dump"):
         assert forbidden not in code
-    assert source.count("write_json_atomic(") == 3
+    assert source.count("write_json_atomic(") == 4
 
 
 # ================ AN. ITPM: input tokens per minute is a third ceiling
@@ -7133,7 +7158,7 @@ def test_the_architecture_is_untouched_by_the_schema_work():
     code = _code_only(block)
     for forbidden in ("write_text", "write_json_atomic", "json.dump"):
         assert forbidden not in code
-    assert source.count("write_json_atomic(") == 3
+    assert source.count("write_json_atomic(") == 4
     # Neither audit may reach Gemini.
     client_source = Path(_llm_client().__file__).read_text(encoding="utf-8")
     builder = client_source.split("def build_client(")[1]
@@ -7266,3 +7291,775 @@ def test_the_research_reasoning_configuration_is_unchanged(run, c3):
     assert request.json is False
     assert request.web_search is True
     assert request.max_tokens == 1000
+
+
+# ============ AQ. production-policy fixes from the first real BAE run
+#
+# The run produced valid artifacts and exposed four policy defects: the
+# code-quality swap rule introduced an interviews bullet it should not,
+# Gemini's recall layer accepted culture language as a code-quality signal,
+# exhausted Gemini accounts were retried three times each, and a stale
+# tracking reference reported SUCCESS while recording nothing.
+
+# ---- 1. the corrected Experience rule -----------------------------------
+
+def _code_quality_signals(healthcare: bool = False):
+    master = engine.load_master()
+    signals = engine.classify_jd(
+        "Company: Acme\nJob Title: Software Engineer\n\nWe review each other's code.",
+        master.section_order)
+    return dataclasses.replace(signals, code_quality=True, healthcare=healthcare,
+                               code_quality_reason="test", healthcare_reason="test")
+
+
+def test_non_healthcare_code_quality_keeps_swe_1_exact():
+    """Only SWE-4 moves. SWE-ALT-INTERVIEWS is not this rule's business."""
+    policy, template = engine.load_policy(), engine.load_template()
+    signals = _code_quality_signals()
+    assert engine.experience_rule_for(signals) == (
+        "Non-healthcare + code-quality/collaboration-heavy", "jd_signal")
+
+    decision = engine.select_experience(template, policy, signals)
+    assert [(source, target) for source, target, _ in decision.swaps] == [
+        ("SWE-4", "SWE-ALT-PR-REVIEW")]
+    assert "SWE-1" in decision.shipped_ids, "SWE-1 must ship exactly"
+    assert "SWE-ALT-INTERVIEWS" not in decision.shipped_ids
+    assert not any("INTERVIEWS" in bullet_id for bullet_id in decision.shipped_ids)
+    # SWE-1 ships its own approved wording, not an alternate's.
+    shipped = {bullet_id: latex for bullet_id, _action, latex in decision.shipped}
+    assert shipped["SWE-1"] == policy.base_entry("SWE-1").latex
+
+
+def test_the_spreadsheet_is_the_authority_for_that_decision():
+    """Fixed at the source, not worked around in Python."""
+    policy = engine.load_policy()
+    label = "Non-healthcare + code-quality/collaboration-heavy"
+    firing = policy.rules_for(label, "jd_signal")
+    assert [(r.source_id, r.target_id) for r in firing] == [
+        ("SWE-4", "SWE-ALT-PR-REVIEW")]
+    # The SWE-1 row still EXISTS, recorded as an explicit no-change, so the
+    # decision is documented in the spreadsheet rather than implied by absence.
+    rows = [r for r in policy.swap_rules
+            if r.label == label and r.source_id == "SWE-1"]
+    assert len(rows) == 1, rows
+    assert rows[0].is_no_change, rows[0].target_id
+    # No Python special-case for this rule anywhere.
+    for module in (engine, run_pipeline, grounding):
+        source = Path(module.__file__).read_text(encoding="utf-8")
+        assert "SWE-ALT-INTERVIEWS" not in source, module.__name__
+    assert engine.verify_experience_ids(policy) == []
+
+
+def test_the_other_interviews_rules_are_untouched():
+    """Only row 170 was wrong; the job-role and healthcare rules still stand."""
+    policy = engine.load_policy()
+    for label, applies_when in (("Code-quality / collaboration-heavy SWE", "job_role"),
+                                ("Healthcare + code-quality-heavy", "jd_signal")):
+        targets = {r.target_id for r in policy.rules_for(label, applies_when)}
+        assert "SWE-ALT-INTERVIEWS" in targets, (label, targets)
+
+
+# ---- 2. the tightened semantic gate --------------------------------------
+
+BAE_CULTURE_SNIPPETS = [
+    "We believe collaboration is key",
+    "Know how to profile, optimize, and test your own code",
+]
+
+
+def test_the_bae_posting_does_not_become_code_quality_heavy(bae):
+    """The exact snippets the live run accepted, now rejected."""
+    payload = {"code_quality_collaboration_heavy": {
+        "present": True, "evidence": BAE_CULTURE_SNIPPETS}}
+    validated, problems = grounding.validate_semantic_signals(payload, bae["jd"].text)
+
+    assert validated["code_quality_collaboration_heavy"] is False
+    assert any("generic collaboration language and individual testing/profiling"
+               in p.message for p in problems)
+    # Deterministic classification never saw it either, so the merge is false.
+    master = engine.load_master()
+    signals = engine.classify_jd(bae["jd"].text, master.section_order)
+    assert signals.code_quality is False
+    merged, overrides = grounding.merge_semantic_signals(signals, validated)
+    assert merged["code_quality_collaboration_heavy"] is False
+    assert overrides["added"] == []
+    # And the Experience rule therefore falls to the role family, as before.
+    assert engine.experience_rule_for(signals) == ("AI/ML-adjacent SWE", "job_role")
+
+
+@pytest.mark.parametrize("snippet", [
+    "participate in design and code reviews",
+    "you will review code from other engineers",
+    "we hold each other to engineering standards",
+    "mentoring engineers is part of the role",
+    "pull request reviews are expected daily",
+    "maintaining code quality across the team",
+])
+def test_real_team_quality_ownership_still_recovers_the_signal(snippet):
+    jd = f"Company: Acme\nJob Title: Engineer\n\n{snippet} and ship Python services.\n"
+    validated, problems = grounding.validate_semantic_signals(
+        {"code_quality_collaboration_heavy": {"present": True, "evidence": [snippet]}}, jd)
+    assert validated["code_quality_collaboration_heavy"] is True, problems
+
+
+@pytest.mark.parametrize("snippet, reason", [
+    ("collaboration is key to how we work", "generic collaboration"),
+    ("you will work well with a team of engineers", "generic collaboration"),
+    ("cross-functional teams ship together here", "generic collaboration"),
+    ("know how to profile, optimize, and test your own code", "individual testing"),
+    ("you write unit tests for your own code", "individual testing"),
+])
+def test_culture_and_individual_craft_alone_never_recover_the_signal(snippet, reason):
+    jd = f"Company: Acme\nJob Title: Engineer\n\n{snippet}\n"
+    validated, problems = grounding.validate_semantic_signals(
+        {"code_quality_collaboration_heavy": {"present": True, "evidence": [snippet]}}, jd)
+    assert validated["code_quality_collaboration_heavy"] is False, snippet
+    assert any("rejected" in p.message for p in problems)
+
+
+def test_the_gate_applies_only_to_the_signal_that_needs_it(bae):
+    """Other taxonomy signals keep grounding as their only test."""
+    assert set(grounding._SIGNAL_GATES) == {"code_quality_collaboration_heavy"}
+    accepted, reason = grounding.signal_evidence_is_meaningful(
+        "ai_native", ["collaboration is key"])
+    assert accepted is True and reason == ""
+
+
+# ---- 3. Gemini rotates immediately on a daily ceiling --------------------
+
+def _rotating_gemini(failures: dict):
+    """A Gemini transport whose per-account behaviour is scripted."""
+    import logging
+
+    import llm_client
+
+    seen: list[tuple[int, str]] = []
+    credentials = engine.Credentials(gemini_accounts=(1, 2),
+                                     _gemini_keys={1: "k1", 2: "k2"})
+
+    class _Scripted(llm_client.GeminiTransport):
+        def _generate(self, api_key, request):
+            account = 1 if api_key == "k1" else 2
+            seen.append((account, request.purpose))
+            category = failures.get(account)
+            if category:
+                raise llm_client.ProviderError(category, f"simulated {category}")
+            return f"answer from account {account}"
+
+    return seen, _Scripted(credentials, logging.getLogger("gemini-rotate"))
+
+
+@pytest.mark.parametrize("category", ["daily_limit_exhausted", "quota_exhausted"])
+def test_an_exhausted_gemini_account_is_abandoned_after_one_attempt(category):
+    import llm_client
+
+    seen, transport = _rotating_gemini({1: category})
+    reply = transport.generate(llm_client.Request("project_selection", "p"))
+
+    assert reply.text == "answer from account 2"
+    # ONE attempt on the exhausted account, then straight to the next.
+    assert [account for account, _ in seen] == [1, 2], seen
+    assert category in llm_client.GEMINI_ROTATE_CATEGORIES
+
+
+def test_a_transient_gemini_failure_still_retries(monkeypatch):
+    import llm_client
+
+    monkeypatch.setattr(llm_client.time, "sleep", lambda _s: None)
+    seen, transport = _rotating_gemini({1: "server_error"})
+    reply = transport.generate(llm_client.Request("project_selection", "p"))
+
+    assert reply.text == "answer from account 2"
+    first_account = [account for account, _ in seen if account == 1]
+    assert len(first_account) > 1, "a 503 must still be retried on the same account"
+    assert len(first_account) == engine.SERVER_ERROR_MAX_ATTEMPTS
+    assert "server_error" not in llm_client.GEMINI_ROTATE_CATEGORIES
+
+
+def test_every_gemini_account_exhausted_fails_once_per_account():
+    import llm_client
+
+    seen, transport = _rotating_gemini({1: "daily_limit_exhausted",
+                                        2: "daily_limit_exhausted"})
+    with pytest.raises(llm_client.ProviderError) as raised:
+        transport.generate(llm_client.Request("project_selection", "p"))
+    assert [account for account, _ in seen] == [1, 2], seen
+    assert raised.value.category == "daily_limit_exhausted"
+
+
+# ---- 4. a stale tracking reference is parked, not papered over ----------
+
+def _tracking_fixture(tmp_path, indexed_folder: str | None):
+    """A tracker whose index points at `indexed_folder` (None = empty index)."""
+    import logging
+
+    output = tmp_path / "output"
+    output.mkdir()
+    run_dir = output / "Acme_Engineer_2026-09-16_120000000001"
+    run_dir.mkdir()
+    for name in run_pipeline.REQUIRED_ARTIFACTS:
+        (run_dir / name).write_text("artifact", encoding="utf-8")
+    (run_dir / "Acme_Engineer.pdf").write_bytes(b"%PDF-1.4 fake")
+
+    csv_path = tmp_path / "processed_jobs.csv"
+    index_path = tmp_path / ".processed_index.json"
+    jd = engine.read_jd(BAE_JD)
+    if indexed_folder is not None:
+        index_path.write_text(json.dumps({jd.fingerprint: {
+            "run_folder": indexed_folder, "source_file": "bae.txt",
+            "recorded_at": "2026-09-01T12:00:00"}}), encoding="utf-8")
+    tracker = run_pipeline.Tracker(csv_path, index_path, enabled=True)
+    log = run_pipeline.StageLog(logging.getLogger("tracking"), "TRACKING")
+    return tracker, jd, run_dir, index_path, csv_path, log
+
+
+def test_a_missing_indexed_folder_is_never_silently_overwritten(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "OUTPUT_DIR", tmp_path / "output")
+    tracker, jd, run_dir, index_path, csv_path, log = _tracking_fixture(
+        tmp_path, "Vanished_Run_2026-09-01_120000")
+    before = index_path.read_bytes()
+
+    outcome = tracker.record(jd, run_dir, "success", log)
+
+    assert outcome.state == run_pipeline.TRACKING_STALE
+    assert outcome.failed is True
+    assert bool(outcome) is False, "a stale reference is not a recording"
+    # The previous record survives byte for byte, and nothing was invented.
+    assert index_path.read_bytes() == before
+    assert not csv_path.exists(), "no duplicate application row"
+    # The current artifacts are untouched.
+    for name in run_pipeline.REQUIRED_ARTIFACTS:
+        assert (run_dir / name).read_text(encoding="utf-8") == "artifact"
+    assert (run_dir / "Acme_Engineer.pdf").exists()
+
+
+def test_the_stale_reference_is_parked_with_repairable_metadata(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "OUTPUT_DIR", tmp_path / "output")
+    tracker, jd, run_dir, index_path, _csv, log = _tracking_fixture(
+        tmp_path, "Vanished_Run_2026-09-01_120000")
+    tracker.record(jd, run_dir, "success", log)
+
+    parked = json.loads(tracker.reconcile_path.read_text(encoding="utf-8"))
+    assert isinstance(parked, list) and len(parked) == 1
+    entry = parked[0]
+    assert entry["fingerprint"] == jd.fingerprint
+    assert entry["indexed_run_folder"] == "Vanished_Run_2026-09-01_120000"
+    assert entry["indexed_folder_exists"] is False
+    assert entry["current_run_folder"] == run_dir.name
+    assert entry["company_name"] == jd.company_name
+    assert entry["state"] == run_pipeline.TRACKING_STALE
+    assert entry["resolution"] == "unresolved", "an explicit state to reconcile"
+    assert entry["detected_at"]
+
+    # Parking is APPEND-only and idempotent for the same run.
+    tracker.record(jd, run_dir, "success", log)
+    assert len(json.loads(tracker.reconcile_path.read_text(encoding="utf-8"))) == 1
+    assert json.loads(tracker.reconcile_path.read_text(encoding="utf-8")) == parked
+
+
+def test_a_clean_tracking_write_is_an_ordinary_success(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "OUTPUT_DIR", tmp_path / "output")
+    tracker, jd, run_dir, index_path, csv_path, log = _tracking_fixture(tmp_path, None)
+
+    outcome = tracker.record(jd, run_dir, "success", log)
+
+    assert outcome.state == run_pipeline.TRACKING_OK
+    assert bool(outcome) is True and outcome.failed is False
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    assert index[jd.fingerprint]["run_folder"] == run_dir.name
+    assert csv_path.exists()
+    assert not tracker.reconcile_path.exists(), "nothing to reconcile"
+
+
+def test_an_idempotent_rerun_is_not_a_tracking_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "OUTPUT_DIR", tmp_path / "output")
+    tracker, jd, run_dir, index_path, csv_path, log = _tracking_fixture(
+        tmp_path, "Acme_Engineer_2026-09-16_120000000001")
+
+    outcome = tracker.record(jd, run_dir, "success", log)
+
+    assert outcome.state == run_pipeline.TRACKING_IDEMPOTENT
+    assert outcome.failed is False, "already recorded is not a failure"
+    assert bool(outcome) is False, "and it is not a new recording either"
+    assert not csv_path.exists()
+
+
+def test_the_status_line_distinguishes_artifacts_from_tracking():
+    source = Path(run_pipeline.__file__).read_text(encoding="utf-8")
+    block = source.split("tracking = tracker.record(")[1].split("provider_summary")[0]
+    assert 'status = "success_with_tracking_warning"' in block
+    assert "tracking.failed" in block
+    assert 'issues.append(' in block
+    # Only a real failure changes the status; skipped and idempotent do not.
+    assert run_pipeline.TRACKING_FAILURES == (run_pipeline.TRACKING_STALE,
+                                              run_pipeline.TRACKING_ABORTED)
+    for state in (run_pipeline.TRACKING_SKIPPED, run_pipeline.TRACKING_IDEMPOTENT,
+                  run_pipeline.TRACKING_OK):
+        assert state not in run_pipeline.TRACKING_FAILURES
+    # The batch summary reports the warning bucket separately.
+    batch = source.split("def run_batch(")[1]
+    assert "success_with_tracking_warning" in batch
+
+
+def test_a_mock_run_reports_skipped_and_stays_a_plain_success(run):
+    """Mock runs never open tracking, so the status is unaffected."""
+    assert "tracking skipped: this is a mock/smoke run" in run["log"]
+    assert "success_with_tracking_warning" not in run["log"]
+    assert "SUCCESS:" in run["stdout"]
+    assert "tracking STOPPED" not in run["log"]
+    assert not (ROOT / ".tracking_reconcile.json").exists() or \
+        "_smoke_tests" not in (ROOT / ".tracking_reconcile.json").read_text(
+            encoding="utf-8")
+
+
+# ---- 5. cover-letter breadth --------------------------------------------
+
+def test_two_supported_priorities_ask_for_the_top_two(run, bae):
+    """BAE offered ML/data, low-level systems and cloud; one theme is thin."""
+    priorities = _priorities_for(BAE_JD, ["lms", "pintos", "tailor_pipeline"])
+    supported = grounding.supported_priorities(priorities)
+    assert len(supported) >= 2, supported
+
+    one_theme = ("Dear Hiring Manager,\n\nI am applying for the Entry Level Software "
+                 "Engineer role at BAE Systems.\n\nAs a data engineering intern I built "
+                 "an ETL workflow in Python with Pandas and NumPy to clean large "
+                 "business datasets.\n\nSincerely,\nJay Niketan Pathare")
+    problems = grounding.letter_relevance(one_theme, priorities)
+    assert problems, "covering only priority 1 should prompt for breadth"
+    assert problems[0].severity == "warning", "never an error"
+    assert "priority 2 is still missing" in problems[0].message
+    assert supported[1]["label"] in problems[0].message
+    # It says WHY it is optional, so the model can decline truthfully.
+    assert "unsupported claim" in problems[0].message
+    assert "length contract" in problems[0].message
+
+
+def test_covering_the_top_two_satisfies_the_breadth_rule(run, bae):
+    priorities = _priorities_for(BAE_JD, ["lms", "pintos", "tailor_pipeline"])
+    supported = grounding.supported_priorities(priorities)
+    two_themes = ("Dear Hiring Manager,\n\nI am applying for the Entry Level Software "
+                  "Engineer role at BAE Systems.\n\nAs a data engineering intern I built "
+                  "an ETL workflow in Python with Pandas and NumPy.\n\nI also implemented "
+                  "the user-programs layer of Pintos, an x86 teaching kernel in C, "
+                  "covering process execution and a system-call handler.\n\nSincerely,\n"
+                  "Jay Niketan Pathare")
+    assert grounding.priority_addressed(two_themes, supported[0])
+    assert grounding.priority_addressed(two_themes, supported[1])
+    assert grounding.letter_relevance(two_themes, priorities) == []
+
+
+def test_the_breadth_rule_never_asks_for_a_third_priority(run, bae):
+    priorities = _priorities_for(BAE_JD, ["lms", "pintos", "tailor_pipeline"])
+    supported = grounding.supported_priorities(priorities)
+    if len(supported) < 3:
+        pytest.skip("this fixture has fewer than three supported priorities")
+    block = grounding.render_letter_priorities(priorities)
+    assert "Do not stretch to a third priority" in block
+    assert "do not lengthen the letter" in block
+    # And a letter covering exactly two is clean, whatever the third is.
+    two = ("ETL workflow with Pandas. Pintos kernel in C with a system-call handler.")
+    assert grounding.letter_relevance(two, priorities) == []
+
+
+def test_the_breadth_rule_is_silent_with_one_supported_priority():
+    master = engine.load_master()
+    jd_text = ("Company: Acme\nJob Title: Kernel Engineer\n\nYou will work on kernel "
+               "memory management, thread synchronization and device drivers in C.\n")
+    requirements = engine.extract_jd_requirements(jd_text, master)
+    priorities = grounding.letter_priorities(
+        jd_text=jd_text, job_title="Kernel Engineer", requirements=requirements,
+        capsules=engine.source_capsules(master, [master.project("pintos")]),
+        master=master, on_resume=["pintos"])
+    supported = grounding.supported_priorities(priorities)
+    if len(supported) != 1:
+        pytest.skip(f"this posting yields {len(supported)} supported priorities")
+    letter = "I implemented the user-programs layer of Pintos, an x86 teaching kernel."
+    assert grounding.letter_relevance(letter, priorities) == []
+    assert "Do not stretch to a third" not in grounding.render_letter_priorities(priorities)
+
+
+def test_the_length_contract_and_grounding_are_unchanged():
+    """Breadth may not buy itself a longer letter or a looser claim."""
+    source = Path(grounding.__file__).read_text(encoding="utf-8")
+    quality = source.split("def validate_letter_quality(")[1].split("\ndef ")[0]
+    assert "min_words: int = 140" in quality and "max_words: int = 300" in quality
+    # The breadth problem is a warning, so it can never block a letter.
+    priorities = _priorities_for(BAE_JD, ["lms", "pintos", "tailor_pipeline"])
+    problems = grounding.letter_relevance("ETL workflow with Pandas and NumPy.",
+                                           priorities)
+    assert grounding.errors(problems) == []
+
+
+# ============ AR. cover-letter metric qualifiers and top-two breadth
+#
+# The production BAE run produced valid artifacts and a rejected letter: the
+# class imbalance was written as an exact "27.6:1" on attempts 1 and 3, and
+# the letter covered priorities 1 and 3 while leaving 2 out. The validators
+# were right both times; what was missing was a correction the model could
+# act on, and memory of what had already failed.
+
+BAE_PROJECTS = ["lms", "pintos", "tailor_pipeline"]
+
+
+def _bae_priorities():
+    return _priorities_for(BAE_JD, BAE_PROJECTS)
+
+
+# ---- 1. the qualifier is part of the fact -------------------------------
+
+def test_a_qualified_source_never_authorizes_the_exact_form():
+    qualified = grounding.extract_metrics("a class imbalance of approximately 27.6:1")[0]
+    assert qualified.approximate is True
+    forms = grounding.safe_metric_forms(qualified)
+    assert forms == ["approximately 27.6", "about 27.6", "~27.6"]
+    assert "27.6" not in forms, "the bare value is never authorized"
+    # An exact source authorizes exactly one form: the bare value.
+    exact = grounding.extract_metrics("reached 0.9259 AUC-ROC")[0]
+    assert exact.approximate is False
+    assert grounding.safe_metric_forms(exact) == ["0.9259 AUC-ROC"]
+
+
+def test_the_safe_forms_use_the_evidence_wording():
+    """Reassembling from parsed parts produced "approximately 3.5 %"."""
+    for text, expected in (("about 3.5% of rows", "approximately 3.5%"),
+                           ("roughly 0.858 AUC-ROC", "approximately 0.858 AUC-ROC"),
+                           ("approximately 2000 ms", "approximately 2000 ms")):
+        metric = grounding.extract_metrics(text)[0]
+        assert grounding.safe_metric_forms(metric)[0] == expected, text
+
+
+@pytest.mark.parametrize("phrase, rejected", [
+    ("a 27.6:1 class imbalance", True),
+    ("an approximately 27.6:1 class imbalance", False),
+    ("an about 27.6:1 class imbalance", False),
+    ("a ~27.6:1 class imbalance", False),
+])
+def test_only_the_qualified_forms_survive_validation(run, phrase, rejected):
+    letter = ("Dear Hiring Manager,\n\nI am applying for the Entry Level Software Engineer "
+              "role at BAE Systems.\n\nI built a graph-based fraud detection pipeline where "
+              f"GraphSAGE handled {phrase} on the IEEE-CIS dataset.\n\nSincerely,\n"
+              "Jay Niketan Pathare")
+    problems = grounding.validate_cover_letter(
+        letter, run["master"], banned=run["policy"].banned_phrases,
+        jd_text="We are hiring.", company="BAE Systems")
+    metric_errors = [p for p in grounding.errors(problems) if p.kind == "metric"]
+    assert bool(metric_errors) is rejected, [p.message for p in metric_errors]
+
+
+def test_the_validator_was_not_loosened(run):
+    """Every other strengthening is still rejected exactly as before."""
+    for phrase in ("45 concurrent users",          # source says 45+
+                   "500 ms broadcast latency",     # source says sub-500 ms
+                   "90% of the manual workload",   # source says approximately 90%
+                   "97% clinical sensitivity"):    # source says 97-99%
+        letter = ("Dear Hiring Manager,\n\nI am applying for the Entry Level Software "
+                  f"Engineer role at BAE Systems.\n\nI served {phrase} in that system."
+                  "\n\nSincerely,\nJay Niketan Pathare")
+        problems = grounding.validate_cover_letter(
+            letter, run["master"], banned=run["policy"].banned_phrases,
+            jd_text="We are hiring.", company="BAE Systems")
+        assert [p for p in grounding.errors(problems) if p.kind == "metric"], phrase
+
+
+def test_qualified_numbers_reach_the_writer_before_it_drafts(run, bae):
+    """Nothing should have to be reconstructed from a rejection message."""
+    master = run["master"]
+    capsules = engine.source_capsules(master, [master.project(p) for p in BAE_PROJECTS])
+    facts = grounding.quantitative_facts(master, capsules)
+    qualified = [f for f in facts if f["qualifier"] == "approximately"]
+    assert qualified, "the evidence does contain qualified numbers"
+    for fact in qualified:
+        assert fact["safe_forms"], fact
+        assert all(form.startswith(("approximately", "about", "~"))
+                   for form in fact["safe_forms"]), fact
+
+    block = grounding.render_quantitative_facts(facts)
+    assert "QUALIFIED NUMBERS" in block
+    assert "strengthens the claim" in block
+    assert "Never add a qualifier to an exact number" in block
+    # And it is in the actual prompt the writer receives.
+    import llm_client
+
+    transport = _SequenceTransport([_letter_body("590,540 transactions")])
+    import logging
+    client = llm_client.LLMClient(transport, transport, master, run["policy"],
+                                   logging.getLogger("test"), audit=transport)
+    _letter_call(client, run, bae, capsules=capsules)
+    assert "QUALIFIED NUMBERS" in transport.requests[0].prompt
+
+
+# ---- 2. the repair is surgical ------------------------------------------
+
+def test_the_rejection_names_the_rejected_and_the_safe_form(run):
+    letter = ("Dear Hiring Manager,\n\nI am applying for the Entry Level Software Engineer "
+              "role at BAE Systems.\n\nGraphSAGE handled a 27.6:1 class imbalance."
+              "\n\nSincerely,\nJay Niketan Pathare")
+    problems = grounding.validate_cover_letter(
+        letter, run["master"], banned=run["policy"].banned_phrases,
+        jd_text="We are hiring.", company="BAE Systems")
+    metric = next(p for p in grounding.errors(problems) if p.kind == "metric")
+
+    assert "REPAIR:" in metric.message
+    assert "REJECTED '27.6'" in metric.message
+    assert "SAFE 'approximately 27.6'" in metric.message
+    assert "'about 27.6'" in metric.message and "'~27.6'" in metric.message
+    assert "Keep the metric" in metric.message
+    assert "change nothing else" in metric.message
+
+
+def test_the_repair_prompt_carries_the_correction_and_the_rules(run, bae):
+    import llm_client
+    import logging
+
+    bad = _letter_body("590,540 transactions").replace(
+        "590,540 transactions", "a 27.6:1 class imbalance on 590,540 transactions")
+    good = _letter_body("590,540 transactions")
+    transport = _SequenceTransport([bad, good])
+    client = llm_client.LLMClient(transport, transport, run["master"], run["policy"],
+                                   logging.getLogger("test"), audit=transport)
+    _letter_call(client, run, bae)
+
+    assert len(transport.requests) >= 2, "the first attempt must be rejected"
+    retry = transport.requests[1].prompt
+    assert "REJECTED '27.6'" in retry
+    assert "SAFE 'approximately 27.6'" in retry
+    assert "HOW TO REPAIR" in retry
+    assert "use the SAFE form given, verbatim" in retry
+    # And the paragraph-isolation instruction travels with it.
+    assert "must stay inside\n    ONE role or project" in retry
+    assert "its OWN paragraph" in retry
+    assert "Replace, do not append" in retry
+
+
+# ---- 3. a failed form is never produced twice ---------------------------
+
+def test_a_rejected_metric_form_is_prohibited_on_later_attempts(run, bae):
+    """Attempt 3 of the live run repeated attempt 1's exact "27.6"."""
+    import llm_client
+    import logging
+
+    bad = _letter_body("590,540 transactions").replace(
+        "590,540 transactions", "a 27.6:1 class imbalance on 590,540 transactions")
+    transport = _SequenceTransport([bad, bad, bad])
+    client = llm_client.LLMClient(transport, transport, run["master"], run["policy"],
+                                   logging.getLogger("test"), audit=transport)
+    letter, problems = _letter_call(client, run, bae)
+
+    assert len(transport.requests) == llm_client.LETTER_ATTEMPTS
+    for request in transport.requests[1:]:
+        retry = request.prompt
+        assert "ALREADY REJECTED IN THIS SESSION" in retry
+        assert "27.6" in retry.split("ALREADY REJECTED IN THIS SESSION")[1]
+    # Attempt history travels too, so the model knows what it already tried.
+    assert "Attempts so far:" in transport.requests[2].prompt
+    # The letter still fails: a prohibition is guidance, not a rewrite.
+    assert [p for p in grounding.errors(problems) if p.kind == "metric"]
+
+
+def test_rejected_forms_are_extracted_from_the_problem_messages():
+    problems = [
+        grounding.Problem("metric", "error",
+                          "letter claims exactly 27.6 ('27.6') ... REPAIR: replace the "
+                          "exact form REJECTED '27.6' with the qualified supported form "
+                          "SAFE 'approximately 27.6'"),
+        grounding.Problem("metric", "error", "no repair note here"),
+    ]
+    assert grounding.rejected_metric_forms(problems) == ["27.6"]
+    assert grounding.rejected_metric_forms([]) == []
+
+
+def test_repair_state_does_not_leak_between_letters(run, bae):
+    """The prohibition list is per generation, never across jobs."""
+    import llm_client
+    import logging
+
+    bad = _letter_body("590,540 transactions").replace(
+        "590,540 transactions", "a 27.6:1 class imbalance on 590,540 transactions")
+    good = _letter_body("590,540 transactions")
+    first = _SequenceTransport([bad, good])
+    client = llm_client.LLMClient(first, first, run["master"], run["policy"],
+                                   logging.getLogger("test"), audit=first)
+    _letter_call(client, run, bae)
+    assert "ALREADY REJECTED" in first.requests[1].prompt
+
+    second = _SequenceTransport([good])
+    client2 = llm_client.LLMClient(second, second, run["master"], run["policy"],
+                                    logging.getLogger("test"), audit=second)
+    _letter_call(client2, run, bae)
+    assert "ALREADY REJECTED" not in second.requests[0].prompt, \
+        "no memory across letters"
+
+
+# ---- 4. top two means the top two ---------------------------------------
+
+def test_priority_one_plus_three_still_warns_about_the_missing_second():
+    """The exact live shape: 1 covered, 2 missing, 3 covered."""
+    priorities = _bae_priorities()
+    supported = grounding.supported_priorities(priorities)
+    assert len(supported) >= 3, [p["label"] for p in supported]
+
+    letter = ("As a data engineering intern I built an ETL workflow in Python with Pandas "
+              "and NumPy. I also deployed AWS EC2 and RDS infrastructure with VPC "
+              "networking and security groups.")
+    assert grounding.priority_addressed(letter, supported[0])
+    assert not grounding.priority_addressed(letter, supported[1])
+    assert grounding.priority_addressed(letter, supported[2])
+
+    problems = grounding.letter_relevance(letter, priorities)
+    assert len(problems) == 1
+    assert problems[0].severity == "warning", "breadth is never a hard error"
+    message = problems[0].message
+    assert "priority 2 is still missing" in message
+    assert supported[1]["label"] in message
+    assert "does not substitute for priority 2" in message
+    assert supported[2]["label"] in message, "it names what WAS covered instead"
+    assert "priority 3 is optional and is never required" in message
+
+
+def test_priority_one_plus_two_clears_the_breadth_warning():
+    priorities = _bae_priorities()
+    supported = grounding.supported_priorities(priorities)
+    letter = ("As a data engineering intern I built an ETL workflow in Python with Pandas. "
+              "Separately, I implemented the user-programs layer of Pintos, an x86 "
+              "teaching kernel in C, with a system-call handler.")
+    assert grounding.priority_addressed(letter, supported[0])
+    assert grounding.priority_addressed(letter, supported[1])
+    assert grounding.letter_relevance(letter, priorities) == [], \
+        "covering the top two is enough, whatever priority 3 says"
+
+
+def test_breadth_is_warning_only_and_cannot_block_a_letter():
+    priorities = _bae_priorities()
+    one_theme = "As a data engineering intern I built an ETL workflow with Pandas."
+    problems = grounding.letter_relevance(one_theme, priorities)
+    assert problems and all(p.severity == "warning" for p in problems)
+    assert grounding.errors(problems) == []
+    assert all(p.kind == "relevance" for p in problems)
+
+
+def test_the_priority_block_never_requires_a_third(run):
+    priorities = _bae_priorities()
+    block = grounding.render_letter_priorities(priorities)
+    assert "Normally cover priority 2" in block
+    assert "Do not stretch to a third priority" in block
+    assert "do not lengthen the letter" in block
+
+
+# ---- 5. paragraph source isolation is unchanged -------------------------
+
+def test_the_source_isolation_validator_is_untouched(run):
+    """Attempt 2 of the live run failed correctly; that check is not relaxed."""
+    master = run["master"]
+    capsules = engine.source_capsules(master, [master.project(p) for p in BAE_PROJECTS])
+    mixed = ("Dear Hiring Manager,\n\nI am applying for the role.\n\n"
+             "I built a decoupled learning management system on Django Channels with "
+             "Locust load testing, and in the same effort passed 80 concurrency and "
+             "memory-fault tests on the Pintos kernel.\n\nSincerely,\nJay")
+    problems = grounding.validate_source_scope(mixed, capsules, master)
+    assert [p for p in problems if p.kind == "source_scope"], "mixing must still fail"
+    assert all(p.severity == "error" for p in problems)
+
+    separate = ("Dear Hiring Manager,\n\nI am applying for the role.\n\n"
+                "I built a decoupled learning management system on Django Channels with "
+                "Locust load testing.\n\nSeparately, I passed 80 concurrency and "
+                "memory-fault tests on the Pintos kernel.\n\nSincerely,\nJay")
+    assert grounding.validate_source_scope(separate, capsules, master) == []
+
+
+# ---- 6. an invalid final letter is still NEEDS_REVIEW -------------------
+
+def test_a_final_grounding_failure_still_blocks_success():
+    source = Path(run_pipeline.__file__).read_text(encoding="utf-8")
+    run_one = source.split("def run_one(")[1].split("\ndef ")[0]
+    # A letter error becomes a run issue, and issues decide the status.
+    assert 'issues += [f"cover letter: {p.message}" for p in grounding.errors(letter_problems)]' \
+        in run_one
+    assert 'status = "success" if not issues else "needs_review"' in run_one
+    # A relevance WARNING is not an error, so breadth alone cannot do this.
+    assert grounding.errors(
+        [grounding.Problem("relevance", "warning", "breadth")]) == []
+
+
+def test_needs_review_never_records_the_application(tmp_path, monkeypatch):
+    import logging
+
+    monkeypatch.setattr(engine, "OUTPUT_DIR", tmp_path / "output")
+    output = tmp_path / "output"
+    output.mkdir()
+    run_dir = output / "BAE_Systems_Entry_Level_Software_Engineer_2026-09-16_120000"
+    run_dir.mkdir()
+    for name in run_pipeline.REQUIRED_ARTIFACTS:
+        (run_dir / name).write_text("artifact", encoding="utf-8")
+
+    csv_path = tmp_path / "processed_jobs.csv"
+    index_path = tmp_path / ".processed_index.json"
+    tracker = run_pipeline.Tracker(csv_path, index_path, enabled=True)
+    outcome = tracker.record(engine.read_jd(BAE_JD), run_dir, "needs_review",
+                             run_pipeline.StageLog(logging.getLogger("t"), "T"))
+
+    assert outcome.state == run_pipeline.TRACKING_SKIPPED
+    assert "needs_review" in outcome.detail
+    assert outcome.failed is False, "a skipped record is not a tracking failure"
+    assert not csv_path.exists() and not index_path.exists()
+
+
+# ---- the BAE repair cycle, end to end -----------------------------------
+
+def test_the_bae_repair_cycle_produces_a_valid_letter(run, bae):
+    """exact 27.6 -> repair feedback -> qualified 27.6 + Pintos -> passes."""
+    import llm_client
+    import logging
+
+    master, policy = run["master"], run["policy"]
+    projects = [master.project(p) for p in BAE_PROJECTS]
+    capsules = engine.source_capsules(master, projects)
+    priorities = _bae_priorities()
+
+    opening = ("Dear Hiring Manager,\n\nI am applying for the Entry Level Software "
+               "Engineer role at BAE Systems. I am completing an M.S. in Computer "
+               "Science at the University at Buffalo, expected February 2027, after "
+               "earning a B.E. in Information Technology.\n\n")
+    etl = ("As a data engineering intern I developed an ETL workflow in Python with "
+           "Pandas, NumPy and MySQL to process and clean large business datasets, then "
+           "generated the reports that surfaced key operational trends from them.\n\n")
+    closing = "\n\nI would be glad to talk through any of this in more detail.\n\nSincerely,\nJay Niketan Pathare"
+    fraud_exact = ("I also built a graph-based fraud detection pipeline over the IEEE-CIS "
+                   "dataset of 590,540 transactions, where GraphSAGE handled a 27.6:1 "
+                   "class imbalance and reached 0.9259 AUC-ROC against an MLP baseline.")
+    fraud_ok = fraud_exact.replace("a 27.6:1", "an approximately 27.6:1")
+    pintos = ("\n\nSeparately, I implemented the user-programs layer of Pintos, an x86 "
+              "teaching kernel written in C, covering process execution, parent-child "
+              "synchronization and a system-call handler.")
+
+    attempt_1 = opening + etl + fraud_exact + closing
+    attempt_2 = opening + etl + fraud_ok + pintos + closing
+    transport = _SequenceTransport([attempt_1, attempt_2])
+    client = llm_client.LLMClient(transport, transport, master, policy,
+                                   logging.getLogger("bae-repair"), audit=transport)
+    letter, problems = client.cover_letter(
+        bae["jd"], run["signals"], [engine.latex_to_plain(l)
+                                     for _, _, l in run["decision"].shipped],
+        projects, themes=engine.jd_themes(bae["requirements"], 5),
+        unsupported=(), capsules=capsules, priorities=priorities)
+
+    # 1. the first draft was rejected for the unqualified metric
+    assert len(transport.requests) == 2
+    calls = [c for c in client.calls if c.purpose == "cover_letter"]
+    assert calls[0].accepted is False
+    assert "27.6" in calls[0].detail
+    # 2. the retry carried the correction
+    assert "SAFE 'approximately 27.6'" in transport.requests[1].prompt
+    # 3. the accepted letter uses the qualified form and gives Pintos its own paragraph
+    assert "approximately 27.6:1" in letter
+    assert not re.search(r"(?<![~\w ])\b27\.6:1", letter.replace("approximately 27.6:1", ""))
+    assert "Pintos" in letter
+    assert grounding.validate_source_scope(letter, capsules, master) == []
+    # 4. it passes: no blocking problem of any kind
+    assert grounding.errors(problems) == [], [p.message for p in problems]
+    assert calls[1].accepted is True
+    # and breadth is satisfied, so no relevance warning remains
+    supported = grounding.supported_priorities(priorities)
+    assert grounding.priority_addressed(letter, supported[0])
+    assert grounding.priority_addressed(letter, supported[1])
+    assert grounding.letter_relevance(letter, priorities) == []
+    assert 140 <= grounding.word_count(letter) <= 300

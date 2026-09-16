@@ -282,6 +282,126 @@ def nearest_evidence(claim: Metric, evidence: list[Metric]) -> Metric | None:
     return min(evidence, key=lambda e: abs(e.value - claim.value), default=None)
 
 
+# ---- qualified metrics: the qualifier is part of the fact ----------------
+#
+# The live BAE letter wrote "27.6:1 class imbalance" three times running.
+# "approximately 27.6:1" is what the evidence says, and dropping the qualifier
+# strengthens the claim - so the validator is right to reject it. What was
+# missing was the correction: the model had to infer from
+# "nearest supported value is approximately 27.6" that it should add a word,
+# and it never did. These helpers render the authorized forms explicitly.
+
+_APPROX_PREFIXES = ("approximately", "about", "~")
+
+
+# The captured span can trail into the next word ("0.895 and"); the fact is
+# the number plus its own unit, nothing after it.
+_METRIC_TAIL = re.compile(r"\s+(?:and|or|to|from|of|in|with|for|the|a|an)\b.*$",
+                          re.IGNORECASE)
+
+
+def metric_body(metric: "Metric") -> str:
+    """The metric as the EVIDENCE writes it, trimmed of any trailing word.
+
+    Built from `raw` rather than reassembled from parsed parts: the evidence
+    wrote "3.5%" and "0.858 AUC-ROC", and telling a writer to use
+    "approximately 3.5 %" or "approximately 0.858 auc-roc" verbatim would be
+    worse than what it already does.
+    """
+    body = _METRIC_TAIL.sub("", (metric.raw or "").strip()).strip()
+    return body or f"{metric.value:g}"
+
+
+def safe_metric_forms(metric: "Metric") -> list[str]:
+    """Every rendering of this metric the evidence actually authorizes.
+
+    A qualified source authorizes only qualified forms; an exact source
+    authorizes the bare number. Structure (`3+`, `sub-500 ms`) rides along in
+    the body, because it is part of the fact too.
+    """
+    body = metric_body(metric)
+    if not metric.approximate:
+        return [body]
+    return [f"~{body}" if prefix == "~" else f"{prefix} {body}"
+            for prefix in _APPROX_PREFIXES]
+
+
+def qualifier_only_mismatch(claim: "Metric", support: "Metric") -> bool:
+    """Same fact, same shape - the letter just dropped the qualifier."""
+    return (support is not None
+            and round(claim.value, 6) == round(support.value, 6)
+            and claim.structure == support.structure
+            and claim.unit == support.unit
+            and support.approximate and not claim.approximate)
+
+
+def metric_repair_note(claim: "Metric", support: "Metric") -> str:
+    """The correction, spelled out, so nothing has to be inferred."""
+    safe = safe_metric_forms(support)
+    return (f" REPAIR: replace the exact form REJECTED {claim.raw!r} with the qualified "
+            f"supported form SAFE {safe[0]!r} (also acceptable: "
+            f"{', '.join(repr(form) for form in safe[1:])}). Keep the metric - it is "
+            f"truthful once qualified - and change nothing else in the letter.")
+
+
+_REJECTED_FORM = re.compile(r"REJECTED '([^']+)'")
+
+
+def rejected_metric_forms(problems: list[Problem]) -> list[str]:
+    """The exact metric spellings an attempt was rejected for.
+
+    Fed back into the next repair prompt as an explicit prohibition, so the
+    same unsupported form cannot be produced twice in one generation.
+    """
+    found: list[str] = []
+    for problem in problems:
+        for match in _REJECTED_FORM.finditer(problem.message or ""):
+            found.append(match.group(1))
+    return found
+
+
+def quantitative_facts(master: MasterFacts, sources: dict[str, str] | None = None
+                       ) -> list[dict]:
+    """Every numeric fact the evidence states, with its qualification status.
+
+    Handed to the writer BEFORE it drafts, so a qualified number never has to
+    be reconstructed from a rejection message. The underlying evidence is not
+    modified: this only reports what is already there.
+    """
+    seen: dict[tuple, dict] = {}
+    for label, text in sorted((sources or {}).items()):
+        for metric in extract_metrics(text):
+            key = metric.identity
+            if key in seen:
+                continue
+            seen[key] = {
+                "source": label,
+                "raw": metric.raw.strip(),
+                "value": metric.value,
+                "unit": metric.unit,
+                "structure": metric.structure,
+                "qualifier": "approximately" if metric.approximate else "exact",
+                "safe_forms": safe_metric_forms(metric),
+            }
+    return list(seen.values())
+
+
+def render_quantitative_facts(facts: list[dict], limit: int = 40) -> str:
+    """The prompt block: what each number is, and how it may be written."""
+    qualified = [f for f in facts if f["qualifier"] == "approximately"]
+    if not qualified:
+        return ""
+    lines = ["QUALIFIED NUMBERS - these facts are APPROXIMATE in the evidence. Writing one "
+             "as an exact value strengthens the claim and will be rejected. If you use one, "
+             "use a listed form verbatim:"]
+    for fact in qualified[:limit]:
+        lines.append(f"  {fact['raw']} ({fact['source']}) -> write "
+                     f"{' or '.join(repr(form) for form in fact['safe_forms'])}")
+    lines.append("  Every other number in the evidence is exact and may be written as it "
+                 "appears. Never add a qualifier to an exact number either.")
+    return "\n".join(lines)
+
+
 # ====================================================== metric attribution
 
 # A cover letter mixes two kinds of fact with two different authorities:
@@ -652,6 +772,11 @@ def validate_cover_letter(text: str, master: MasterFacts, *,
             continue
         nearest = nearest_evidence(claim, evidence_metrics)
         detail = f"; nearest supported value is {nearest.describe()}" if nearest else ""
+        # When the ONLY difference is the dropped qualifier, say exactly what
+        # to write. The live BAE letter produced bare "27.6:1" on attempts 1
+        # and 3 because the correction had to be inferred from the message.
+        if qualifier_only_mismatch(claim, nearest):
+            detail += metric_repair_note(claim, nearest)
         if entry.attribution == "employer":
             problems.append(Problem("metric", "error",
                                     f"letter attributes {claim.describe()} ({claim.raw!r}) to "
@@ -2232,6 +2357,13 @@ def render_letter_priorities(priorities) -> str:
                  "that evidence. Do not keyword-stuff and do not try to mention every "
                  "priority: two strong evidence stories beat five shallow ones. This "
                  "changes WHICH supported evidence you choose, never what you may claim.")
+    if len(supported) >= 2:
+        lines.append(
+            f"Normally cover priority 2 ({supported[1]['label']}) as well, so the letter "
+            f"represents the role rather than one theme of it. Skip it only if covering it "
+            f"would need a claim the evidence does not support, or would push the letter "
+            f"past its length contract. Do not stretch to a third priority, and do not "
+            f"lengthen the letter to fit one in.")
     return "\n".join(lines)
 
 
@@ -2246,13 +2378,36 @@ def letter_relevance(letter: str, priorities) -> list[Problem]:
     if not supported or not (letter or "").strip():
         return []
     top = supported[0]
-    if priority_addressed(letter, top):
-        return []
-    return [Problem("relevance", "warning",
-                    f"the letter is grounded but does not use the strongest supported "
-                    f"evidence for the role's primary distinctive requirement: "
-                    f"{top['label']} (available evidence: {top['source_name']} - "
-                    f"{', '.join(top['evidence_terms'])})")]
+    if not priority_addressed(letter, top):
+        return [Problem("relevance", "warning",
+                        f"the letter is grounded but does not use the strongest supported "
+                        f"evidence for the role's primary distinctive requirement: "
+                        f"{top['label']} (available evidence: {top['source_name']} - "
+                        f"{', '.join(top['evidence_terms'])})")]
+    # BREADTH. With two or more supported priorities, spending the whole letter
+    # on one theme under-represents the role: the BAE posting offered ML/data,
+    # low-level systems and cloud, and the letter answered only the first.
+    # Covering the top two is the ask, never all of them, and never at the cost
+    # of an unsupported claim or the length contract - so this stays a warning
+    # the bounded retry may act on, exactly like the primary check.
+    if len(supported) >= 2 and not priority_addressed(letter, supported[1]):
+        second = supported[1]
+        # TOP TWO means the top two. The live BAE letter covered priorities 1
+        # and 3 and left 2 out, which is not the same thing: a lower-ranked
+        # priority does not stand in for a higher-ranked one.
+        covered_lower = [p["label"] for p in supported[2:]
+                         if priority_addressed(letter, p)]
+        instead = (f" The letter does cover {', '.join(covered_lower)}, but a lower-ranked "
+                   f"priority does not substitute for priority 2."
+                   if covered_lower else "")
+        return [Problem("relevance", "warning",
+                        f"priority 2 is still missing: the letter covers priority 1 but not "
+                        f"{second['label']}, which has evidence available "
+                        f"({second['source_name']} - {', '.join(second['evidence_terms'])})."
+                        f"{instead} Cover priority 2 only if it fits the existing length "
+                        f"contract without any unsupported claim; priority 3 is optional "
+                        f"and is never required.")]
+    return []
 
 
 # ============================== post-run Groq audit layer
@@ -2711,6 +2866,74 @@ def evidence_is_grounded(snippet: str, jd_flat: str) -> bool:
     return flat in jd_flat
 
 
+# ---- signal-specific evidence gates --------------------------------------
+#
+# Grounding proves a snippet came from the posting. It does not prove the
+# snippet MEANS the signal. The live BAE run recovered
+# code_quality_collaboration_heavy from "collaboration is key" and "know how
+# to profile, optimize, and test your own code" - both real quotes, neither
+# evidence of team-level engineering-quality ownership. Culture language and
+# individual craft are not a code-review culture.
+
+# Team-level ownership of implementation quality. One of these must appear.
+_CODE_QUALITY_MARKERS = (
+    r"code\s*review", r"review(?:s|ing|ed)?\s+(?:each other'?s?\s+)?code",
+    r"peer\s+review",
+    r"pull\s+request", r"merge\s+request", r"\bPR\b\s*(?:review|standard|process)",
+    r"code\s+quality\s+(?:standard|ownership|across|of\s+the\s+team)",
+    r"maintain(?:ing)?\s+(?:the\s+)?(?:team'?s?\s+)?code\s+quality",
+    r"engineering\s+(?:standards|best\s+practices|excellence)",
+    r"coding\s+standards", r"mentor(?:ing|ship)?\s+(?:other\s+)?engineers",
+    r"mentor(?:ing|ship)?\s+(?:junior|new)\s+(?:engineers|developers)",
+    r"technical\s+leadership", r"design\s+review",
+    r"collaborative\s+ownership", r"shared\s+ownership\s+of\s+(?:code|quality)",
+    r"raise\s+the\s+bar", r"uphold\s+(?:code|engineering)\s+quality",
+)
+
+# Present on almost every posting, and meaningless on their own.
+_GENERIC_COLLABORATION = (
+    r"collaboration\s+is\s+key", r"team\s*player", r"work\s+(?:well\s+)?"
+    r"(?:with|in)\s+(?:a\s+)?team", r"cross[- ]functional", r"communicat",
+    r"paired?\s+with\s+a\s+mentor", r"onboarding", r"agile", r"scrum",
+    r"stand[- ]?up", r"we\s+believe", r"culture",
+)
+
+# Individual craft. Testing your OWN code is not owning a team's quality.
+_INDIVIDUAL_CRAFT = (
+    r"your\s+own\s+code", r"profile,?\s+optimi[sz]e", r"unit\s+test",
+    r"write\s+tests?", r"debugging", r"test\s+your", r"self[- ]test",
+)
+
+_SIGNAL_GATES = {"code_quality_collaboration_heavy": _CODE_QUALITY_MARKERS}
+
+
+def signal_evidence_is_meaningful(signal: str, snippets: list[str]) -> tuple[bool, str]:
+    """Does grounded evidence actually SUPPORT this signal, not just exist?
+
+    Only signals with a gate are checked; everything else passes, because
+    grounding plus the fixed taxonomy is enough for them. Returns
+    (accepted, reason) so the rejection can say what was wrong.
+    """
+    markers = _SIGNAL_GATES.get(signal)
+    if not markers:
+        return True, ""
+    text = " ".join(snippets).lower()
+    if any(re.search(pattern, text, re.IGNORECASE) for pattern in markers):
+        return True, ""
+    generic = [p for p in _GENERIC_COLLABORATION
+               if re.search(p, text, re.IGNORECASE)]
+    craft = [p for p in _INDIVIDUAL_CRAFT if re.search(p, text, re.IGNORECASE)]
+    if generic and craft:
+        detail = "generic collaboration language and individual testing/profiling only"
+    elif generic:
+        detail = "generic collaboration or culture language only"
+    elif craft:
+        detail = "individual testing, profiling or debugging only"
+    else:
+        detail = "no team-level engineering-quality ownership in the evidence"
+    return False, detail
+
+
 def validate_semantic_signals(raw, jd_text: str) -> tuple[dict, list[Problem]]:
     """Keep only taxonomy signals whose positive claims the JD supports.
 
@@ -2778,6 +3001,15 @@ def validate_semantic_signals(raw, jd_text: str) -> tuple[dict, list[Problem]]:
             problems.append(Problem("semantic_signals", "warning",
                                     f"{key}: kept on {len(grounded)} grounded snippet(s); "
                                     f"the rest were not found in the posting"))
+        # Grounded is not the same as meaningful. A signal with a gate must
+        # show evidence that actually carries it.
+        meaningful, reason = signal_evidence_is_meaningful(key, grounded)
+        if not meaningful:
+            problems.append(Problem("semantic_signals", "warning",
+                                    f"{key}: rejected, the grounded evidence shows "
+                                    f"{reason} ({[s[:60] for s in grounded[:2]]})"))
+            validated[key] = False
+            continue
         validated[key] = True
     return validated, problems
 

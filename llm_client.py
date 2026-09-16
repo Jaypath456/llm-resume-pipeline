@@ -107,6 +107,14 @@ KEY_SPECIFIC_CATEGORIES = frozenset({"auth_permission", "invalid_key"})
 
 # Never retried: the same request cannot succeed, and on a daily ceiling no
 # amount of waiting inside this run will help either.
+# Failures that belong to the ACCOUNT, not to the request. Retrying the same
+# bytes against the same account cannot help, so Gemini rotates immediately.
+# Transient categories (server_error, rate_limited) keep the existing backoff:
+# a per-minute limit clears, a daily one does not.
+GEMINI_ROTATE_CATEGORIES = frozenset({
+    "quota_exhausted", "daily_limit_exhausted", "auth_permission", "invalid_key",
+})
+
 NON_RETRYABLE_CATEGORIES = frozenset({
     "request_too_large", "output_truncated", "bad_request",
     "daily_limit_exhausted", "quota_exhausted",
@@ -365,7 +373,14 @@ class GeminiTransport:
                     if error.category == "bad_request":
                         raise FailFast(error.category,
                                        f"Gemini rejected the request ({error}); not retrying")
-                    if error.category in ("quota_exhausted", "auth_permission"):
+                    if error.category in GEMINI_ROTATE_CATEGORIES:
+                        # No point spending two more identical attempts on an
+                        # account whose DAILY quota is gone, or whose key is
+                        # bad: rotate immediately. The live run burned three
+                        # attempts per account before moving on.
+                        self.log.info("gemini account #%d is out for this call "
+                                      "(category=%s); rotating without retrying it",
+                                      account, error.category)
                         break                            # rotate to the next account
                     limit = (SERVER_ERROR_MAX_ATTEMPTS if error.category == "server_error"
                              else RATE_LIMIT_MAX_ATTEMPTS)
@@ -1022,6 +1037,41 @@ _MONTH_NAMES = {1: "January", 2: "February", 3: "March", 4: "April", 5: "May", 6
                 7: "July", 8: "August", 9: "September", 10: "October", 11: "November",
                 12: "December"}
 
+# A repair-capable letter fixture. The live BAE run failed three times on the
+# same unqualified metric, so the mock now reproduces that first mistake and
+# then ACTS on the repair feedback, which is the behaviour under test: read
+# the prompt, obey the SAFE form, obey the prohibition list, add the missing
+# priority as its own paragraph.
+MOCK_FRAUD_EXACT = (
+    "I also built a graph-based fraud detection pipeline over the IEEE-CIS dataset "
+    "of 590,540 transactions, where GraphSAGE handled a 27.6:1 class imbalance and "
+    "reached 0.9259 AUC-ROC against an MLP baseline.")
+
+MOCK_FRAUD_QUALIFIED = (
+    "I also built a graph-based fraud detection pipeline over the IEEE-CIS dataset "
+    "of 590,540 transactions, where GraphSAGE handled an approximately 27.6:1 class "
+    "imbalance and reached 0.9259 AUC-ROC against an MLP baseline.")
+
+# Pintos gets its OWN paragraph. Splicing it into the fraud paragraph is what
+# failed attempt 2 of the live run on source isolation.
+MOCK_PINTOS_PARAGRAPH = (
+    "Separately, I implemented the user-programs layer of Pintos, an x86 teaching "
+    "kernel written in C, covering process execution, parent-child synchronization "
+    "and a system-call handler, and passed 100% of 80 concurrency and memory-fault "
+    "tests.")
+
+
+def _letter_repair_state(prompt: str) -> dict:
+    """What the repair feedback in this prompt is actually asking for."""
+    return {
+        "safe_form": "SAFE 'approximately 27.6'" in prompt or "approximately 27.6" in prompt,
+        "metric_rejected": "REJECTED '27.6'" in prompt,
+        "form_prohibited": "ALREADY REJECTED IN THIS SESSION" in prompt,
+        "needs_priority_two": "priority 2 is still missing" in prompt,
+        "source_isolation": "mixes evidence from" in prompt,
+    }
+
+
 MOCK_PROJECT_PARAGRAPHS = {
     "lms": ("Outside work I built a decoupled learning management system whose real-time "
             "layer runs on Django Channels, Daphne, Redis and WebSockets, serving 45+ "
@@ -1214,8 +1264,15 @@ class MockTransport:
         return {"bullet": alternatives[0] if alternatives else bullet}
 
     def _letter(self, context: dict) -> str:
-        """Assemble a letter from the current approved facts, per JD."""
+        """Assemble a letter from the current approved facts, per JD.
+
+        Reads the repair feedback in the prompt, exactly as a real model
+        would: the first draft of a fraud-project letter states the class
+        imbalance without its qualifier, and the retry corrects it to the SAFE
+        form and adds the missing priority as its own paragraph.
+        """
         jd_text = (context.get("jd_text") or "").lower()
+        repair = _letter_repair_state(context.get("prompt") or "")
         ranked = list(context.get("project_ids") or ["lms"])
         # A real model reads ROLE-DISTINCTIVE PRIORITIES and leads with the
         # evidence it points at; this fixture imitates that so the mock proves
@@ -1241,19 +1298,33 @@ class MockTransport:
                  ("verification", "tailor_pipeline"), ("llm", "tailor_pipeline")]
         chosen = next((pid for needle, pid in keyed
                        if needle in jd_text and pid in ranked), ranked[0])
+        # The metric-repair path. A first draft that uses the fraud project
+        # states the class imbalance unqualified, which is the live defect;
+        # once the prompt carries the SAFE form (or prohibits the rejected
+        # one), the fixture writes the qualified form instead.
+        if "fraud" in ranked and not project_paragraph:
+            project_paragraph = (MOCK_FRAUD_QUALIFIED
+                                 if (repair["safe_form"] or repair["form_prohibited"])
+                                 else MOCK_FRAUD_EXACT)
+        # The breadth repair: priority 2 arrives as its OWN paragraph, never
+        # spliced into another source's.
+        extra = ""
+        if repair["needs_priority_two"] and "pintos" in ranked:
+            extra = "\n\n" + MOCK_PINTOS_PARAGRAPH
         eligibility = ""
         if context.get("needs_eligibility"):
             eligibility = (" I am completing an M.S. in Computer Science at the University "
                            "at Buffalo, expected February 2027, after earning a B.E. in "
                            "Information Technology.")
+        body = project_paragraph or MOCK_PROJECT_PARAGRAPHS.get(
+            chosen, MOCK_PROJECT_PARAGRAPHS["lms"])
         return MOCK_LETTER.format(
             paragraph_one=MOCK_OPENING.format(
                 job_title=context.get("job_title") or "Software Engineer",
                 company=context.get("company") or "your team",
                 eligibility=eligibility),
             paragraph_two=MOCK_EXPERIENCE_PARAGRAPH,
-            project_paragraph=project_paragraph or MOCK_PROJECT_PARAGRAPHS.get(
-                chosen, MOCK_PROJECT_PARAGRAPHS["lms"]))
+            project_paragraph=body + extra)
 
     # -- audit fixtures --------------------------------------------------
     # Deterministic stand-ins for the three Groq audit calls. They imitate a
@@ -1487,6 +1558,23 @@ FACTUAL RULES (absolute):
   Never strengthen or weaken a threshold.
 - Do not invent scope, team size, ownership, business impact, or results.
 - Do not name a technology the evidence does not name."""
+
+
+# Repair guidance, appended only when an attempt was rejected. Says HOW to fix
+# each class of failure the validators can raise, because a validator message
+# states what is wrong, not what to write instead.
+_LETTER_REPAIR_RULES = """HOW TO REPAIR (apply only to the problems listed above):
+  * A metric flagged with a REPAIR note: use the SAFE form given, verbatim, in place of
+    the REJECTED form. Do not delete the metric - it is truthful once qualified - and do
+    not touch any other sentence.
+  * A paragraph that mixes sources: every substantive evidence paragraph must stay inside
+    ONE role or project. If a new project needs to appear, give it its OWN paragraph or
+    replace an existing evidence paragraph wholesale. Never splice one project's facts
+    into another project's or a role's paragraph.
+  * A missing distinctive priority: add it as its own evidence paragraph, or swap it in
+    for a weaker one. Covering a LOWER-numbered priority is what matters; a third
+    priority never substitutes for a missing second one.
+  * Stay inside the existing length contract. Replace, do not append."""
 
 
 _LETTER_RULES = """STRUCTURE - four short paragraphs, no headings:
@@ -2045,6 +2133,12 @@ Do not drop a number to save space; drop a clause instead. Do not add a new clai
         # are already authorized; it never widens what may be claimed.
         priorities = list(priorities or [])
         priority_block = grounding.render_letter_priorities(priorities)
+        # Qualified numbers, with the forms they may be written in. Exposed up
+        # front so a writer never has to reconstruct "approximately 27.6:1"
+        # from a rejection message - which is how the live letter produced a
+        # bare "27.6:1" on attempts 1 and 3.
+        numbers_block = grounding.render_quantitative_facts(
+            grounding.quantitative_facts(self.master, capsules or {}))
         base = f"""Write a cover letter for this job, grounded strictly in the evidence below.
 
 JOB DESCRIPTION:
@@ -2068,6 +2162,8 @@ to mention every requirement.
 
 {priority_block}
 
+{numbers_block}
+
 {_LETTER_RULES}
 
 {'ELIGIBILITY: this posting states a graduation requirement (' + grad['text'] + '). At most ONE concise sentence may mention the degree. Use the candidate standing facts verbatim and NEVER the posting window as the candidate date: expected graduation is February 2027. Omit OPT entirely unless work authorization or start timing is material to this posting; if it is, the only supported wording is "eligible to begin post-completion OPT employment from February 2, 2027, subject to OPT/EAD authorization".' if grad else 'ELIGIBILITY: this posting states no graduation or authorization requirement, so do not discuss immigration or logistics unless it strengthens the match.'}
@@ -2084,6 +2180,11 @@ Return ONLY the letter itself as plain text: no JSON, no code fences, no comment
         # here; transport retry/failover stays owned by the transport layer.
         letter = ""
         problems: list[grounding.Problem] = []
+        # Repair state for THIS letter only - never across jobs. Attempt 3 of
+        # the live run repeated attempt 1's rejected metric because nothing
+        # remembered it had already failed.
+        banned_forms: list[str] = []
+        history: list[str] = []
         for attempt in range(1, LETTER_ATTEMPTS + 1):
             prompt = base
             repair = [p for p in problems
@@ -2093,6 +2194,14 @@ Return ONLY the letter itself as plain text: no JSON, no code fences, no comment
                            "and change nothing else. Keep every remaining sentence "
                            "grounded in the evidence above:\n"
                            + "\n".join(f"  - {p.message}" for p in repair))
+                prompt += "\n\n" + _LETTER_REPAIR_RULES
+            if banned_forms:
+                prompt += ("\n\nALREADY REJECTED IN THIS SESSION - these exact forms failed "
+                           "validation on an earlier attempt and must NOT appear again:\n"
+                           + "\n".join(f"  - {form}" for form in dict.fromkeys(banned_forms)))
+            if history:
+                prompt += ("\n\nAttempts so far: " + "; ".join(history)
+                           + ". Do not reintroduce a problem you already fixed.")
             # Gemini writes the cover letter. Groq is the audit provider only,
             # so no cover-letter request may reach it or its fallback chain.
             reply = self._invoke(self.gemini, Request(
@@ -2101,7 +2210,10 @@ Return ONLY the letter itself as plain text: no JSON, no code fences, no comment
                          "project_ids": [p.project_id for p in projects],
                          "jd_text": jd.text, "needs_eligibility": bool(grad),
                          "themes": [r.headline for r in themes],
-                         "priorities": priorities}))
+                         "priorities": priorities,
+                         # The fixture reads its own repair feedback; real
+                         # transports ignore `context` entirely.
+                         "prompt": prompt}))
             letter = reply.text.strip()
             if len(letter) < 200:
                 raise ProviderError("malformed_response",
@@ -2123,16 +2235,23 @@ Return ONLY the letter itself as plain text: no JSON, no code fences, no comment
                 self.reject_last("cover-letter relevance: " + relevance[0].message)
                 self.log.warning("[COVER LETTER] attempt %d retried for relevance: %s",
                                  attempt, relevance[0].message)
+                history.append(f"attempt {attempt}: breadth")
                 problems = problems + relevance
                 continue
             if not blocking:
                 return letter, problems + relevance
             # The provider answered, but an invalid letter is not a usable
             # artifact. Transport success and acceptance are audited separately.
+            banned_forms.extend(grounding.rejected_metric_forms(blocking))
+            history.append(f"attempt {attempt}: "
+                           + ", ".join(sorted({p.kind for p in blocking})))
             self.reject_last("cover-letter validation failed: " + "; ".join(
                 p.message for p in blocking[:3]))
             self.log.warning("[COVER LETTER] attempt %d rejected: %s", attempt,
                              "; ".join(p.message for p in blocking[:2]))
+            if banned_forms:
+                self.log.info("[COVER LETTER] forms now prohibited for the remaining "
+                              "attempts: %s", ", ".join(dict.fromkeys(banned_forms)))
         return letter, problems
 
     # -- audit #2: current company research ------------------------------
