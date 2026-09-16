@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -44,8 +46,12 @@ def run(tmp_path_factory) -> dict:
                          completed.stdout, re.MULTILINE)
     assert reported, f"the CLI reported no run folder\n{completed.stdout[-3000:]}"
     run_dir = Path(reported.group(1).strip())
-    pdf_path = run_dir / "resume.pdf"
-    assert pdf_path.exists(), f"no PDF was produced\n{completed.stdout[-3000:]}"
+    # A successful run renames the verified PDF to <Company>_<Job_Title>.pdf,
+    # so there is exactly one PDF and it is not called resume.pdf.
+    produced = sorted(run_dir.glob("*.pdf"))
+    assert len(produced) == 1, f"expected one final PDF, got {produced}"
+    pdf_path = produced[0]
+    assert pdf_path.name != "resume.pdf", pdf_path.name
 
     master = engine.load_master()
     policy = engine.load_policy()
@@ -671,7 +677,15 @@ def test_letter_quality_rejects_generic_and_markdown():
 # ---- K. Assessment quality -----------------------------------------------
 
 def _assessment(run) -> dict:
-    return json.loads((run["dir"] / "assessment.json").read_text())
+    # assessment.json is gone by design; the rich structure lives in
+    # strategy.json while assessment.txt stays a small advisory report.
+    block = json.loads((run["dir"] / "strategy.json").read_text())["assessment"]
+    detail = block.get("detail") or {}
+    return {**block, **detail,
+            "eligibility": {"status": block.get("eligibility"),
+                            "details": block.get("eligibility_detail") or []},
+            "tailoring_quality": {"score": block.get("tailoring_quality"),
+                                  "notes": block.get("tailoring_notes") or []}}
 
 
 def test_assessment_matches_the_schema(run):
@@ -2406,8 +2420,12 @@ def test_cover_letter_repairs_an_inexact_metric_on_retry(run, bae):
     assert letters[0].accepted is False
     assert "validation failed" in letters[0].detail
     assert letters[1].accepted is True
-    # the retry prompt carried the exact validator message
-    assert "failed deterministic validation" in transport.requests[1].prompt
+    # the retry prompt carried the exact validator message. The preamble is
+    # "was rejected" rather than "failed deterministic validation" because a
+    # relevance retry is not a validation failure.
+    retry = transport.requests[1].prompt
+    assert "Previous attempt was rejected" in retry
+    assert "nearest supported value is exactly 590540" in retry
     # grounding was not weakened: the bad rendering still fails on its own
     solo = grounding.validate_cover_letter(
         bad, run["master"], banned=run["policy"].banned_phrases,
@@ -2619,40 +2637,76 @@ def test_csv_failure_after_a_committed_index_is_not_rolled_back(tmp_path, monkey
 
 # ---- X. Malformed provider JSON and corrupt tracking state ---------------
 
-def test_assessment_retries_malformed_json_then_accepts(run, bae):
-    """Unparseable output is a rejected structural attempt, not a hard failure."""
+def test_unparseable_assessment_output_is_not_retried_in_a_looser_mode(run, bae):
+    """Strict Structured Outputs makes the SHAPE the provider's contract.
+
+    Under json-object mode an unparseable reply was worth one more attempt.
+    Under a strict schema it means the provider broke its own guarantee, which
+    a reworded prompt cannot fix - and retrying in a looser mode would hide a
+    schema bug. So it fails once, clearly.
+    """
+    import llm_client
+
     transport, client = _sequence_client(
         run, ["I'm sorry, I cannot produce JSON for this request.",
               _assessment_payload(bae, broken=False)])
-    data = _assess_call(client, run, bae)
+    with pytest.raises(llm_client.ProviderError) as raised:
+        _assess_call(client, run, bae)
 
+    assert raised.value.category == "malformed_response"
+    assert "strict structured output" in str(raised.value)
     calls = [c for c in client.calls if c.purpose == "assessment"]
-    assert len(calls) == 2
+    assert len(calls) == 1, "there must be no second, looser attempt"
     assert calls[0].transport_ok is True
     assert calls[0].accepted is False
     assert "malformed JSON" in calls[0].detail
-    assert calls[1].accepted is True
-    assert "not JSON" in transport.requests[1].prompt
+    # The second payload was never requested.
+    assert len(transport.requests) == 1
 
-    # Python's verdicts remain authoritative after a parse-level retry
+
+def test_a_schema_the_endpoint_rejects_surfaces_as_its_own_error():
+    """A configuration 400 must not be retried or hidden behind a fallback."""
+    import llm_client
+
+    assert llm_client.classify_http(
+        400, "Failed to validate JSON. Please adjust your prompt. "
+             "code=json_validate_failed") == "schema_rejected"
+    assert llm_client.classify_http(400, "invalid json_schema") == "schema_rejected"
+    assert "schema_rejected" in llm_client.NON_RETRYABLE_CATEGORIES
+    assert "schema_rejected" not in llm_client.KEY_SPECIFIC_CATEGORIES
+
+    attempts = []
+
+    def reject(self, request):
+        attempts.append(1)
+        raise llm_client.ProviderError("schema_rejected", "json_validate_failed")
+
+    transport = _stub_groq(generate=reject, model=QWEN)
+    with pytest.raises(llm_client.ProviderError) as raised:
+        transport.generate(llm_client.Request("assessment", "p", max_tokens=900))
+    assert attempts == [1], "a rejected schema is never retried"
+    assert raised.value.category == "schema_rejected"
+    # And no Gemini fallback is reachable from the audit transport.
+    assert transport.fallback is None
+
+
+def test_schema_validation_does_not_replace_python_validation(run, bae):
+    """The schema guarantees shape; Python still owns the business rules."""
+    source = Path(_llm_client().__file__).read_text(encoding="utf-8")
+    assess = source.split("    def assess(")[1].split("\n    def ")[0]
+    for step in ("parse_json(reply.text", "grounding.canonicalize_assessment(",
+                 "grounding.validate_assessment(",
+                 "grounding.validate_application_audit(",
+                 "grounding.finalize_assessment("):
+        assert step in assess, step
+    # Python's verdicts still overwrite the model's buckets.
+    transport, client = _sequence_client(run, [_assessment_payload(bae, broken=False)])
+    data = _assess_call(client, run, bae)
     assert data["verdict_source"] == "python_deterministic"
     actual = {e["requirement_id"]: b for b in
               ("strong_matches", "partial_matches", "gaps", "manual_review")
               for e in data[b]}
     assert actual == engine.verdict_index(_assess_verdicts(bae))
-
-
-def test_three_malformed_json_replies_raise_provider_error(run, bae):
-    import llm_client
-
-    junk = "not json at all"
-    transport, client = _sequence_client(run, [junk, junk, junk])
-    with pytest.raises(llm_client.ProviderError):
-        _assess_call(client, run, bae)
-    calls = [c for c in client.calls if c.purpose == "assessment"]
-    assert len(calls) == 3
-    assert all(c.transport_ok is True for c in calls)
-    assert all(c.accepted is False for c in calls)
 
 
 def test_assessment_transport_errors_are_not_retried_here(run, bae):
@@ -2737,3 +2791,4478 @@ def test_a_disabled_tracker_ignores_a_corrupt_index(tmp_path, bae):
     index.write_text("")
     tracker = run_pipeline.Tracker(tmp_path / "processed.csv", index, enabled=False)
     assert tracker.already_processed(bae["jd"].fingerprint) is None
+
+
+# ---- Y. Redwood/Superhuman real-JD defects -------------------------------
+
+# The Superhuman posting was renamed on disk; locate it rather than assume.
+REDWOOD_JD = next((p for p in sorted((ROOT / "jobs").glob("*.txt"))
+                   if "Superhuman" in p.read_text(encoding="utf-8")),
+                  ROOT / "jobs" / "redwoodq.txt")
+
+
+@pytest.fixture(scope="session")
+def redwood() -> dict:
+    master = engine.load_master()
+    jd = engine.read_jd(REDWOOD_JD)
+    requirements = engine.extract_jd_requirements(jd.text, master)
+    return {"master": master, "jd": jd, "requirements": requirements}
+
+
+def _redwood_requirement(redwood, needle: str) -> engine.Requirement:
+    found = [r for r in redwood["requirements"] if needle.lower() in r.original_text.lower()]
+    assert len(found) == 1, (needle, [r.original_text[:60] for r in redwood["requirements"]])
+    return found[0]
+
+
+def test_redwood_company_is_superhuman_not_the_filename(redwood):
+    """"redwood.txt" is not evidence that the employer is Redwood."""
+    assert redwood["jd"].company_name == "Superhuman"
+    assert "Redwood" not in (redwood["jd"].company_name or "")
+
+
+def test_redwood_title_keeps_the_early_career_qualifier(redwood):
+    assert redwood["jd"].job_title == "Software Engineer, Early Career"
+
+
+def test_filename_is_never_authoritative_for_a_substantive_posting(tmp_path):
+    """The stem may still rescue a scrap of a file, never a real posting."""
+    real = tmp_path / "acmecorp.txt"
+    real.write_text(REDWOOD_JD.read_text(encoding="utf-8"), encoding="utf-8")
+    assert engine.substantive_jd(real.read_text(encoding="utf-8"))
+    assert engine.read_jd(real).company_name == "Superhuman"
+
+    scrap = tmp_path / "acmecorp2.txt"
+    scrap.write_text("A short note, not a posting.")
+    assert not engine.substantive_jd(scrap.read_text())
+    assert engine.read_jd(scrap).company_name == "Acmecorp2"
+
+
+@pytest.mark.parametrize("benefit", [
+    "Disability and life insurance options",
+    "401(k) and RRSP matching",
+    "Paid parental leave",
+    "20 days of paid time off per year",
+    "Generous stipends",
+    "Annual professional development budget",
+    "Excellent health care",
+])
+def test_redwood_benefits_never_become_requirements(redwood, benefit):
+    for requirement in redwood["requirements"]:
+        assert benefit.lower() not in requirement.original_text.lower(), requirement
+
+
+def test_benefit_sections_are_recognized_with_or_without_a_colon():
+    for heading in ("Compensation and Benefits", "Benefits:", "Perks",
+                    "Why You'll Love It Here", "What We Offer"):
+        assert engine.suppressed_section(heading), heading
+    for heading in ("Requirements:", "Must-haves:", "What You'll Do", "Education"):
+        assert not engine.suppressed_section(heading), heading
+
+
+def test_product_go_is_not_the_go_language_but_the_language_list_is(redwood):
+    """Both Go sentences together, so neither reading can regress."""
+    product = _redwood_requirement(redwood, "Build and iterate on features for Grammarly")
+    assert "Go" in product.original_text
+    assert product.terms == (), product.terms
+
+    languages = _redwood_requirement(redwood, "Proficiency in at least one programming")
+    assert "Go" in languages.terms
+    assert "Python" in languages.terms
+
+
+def test_python_satisfies_the_redwood_language_or_group(redwood):
+    languages = _redwood_requirement(redwood, "Proficiency in at least one programming")
+    assert engine.any_of_list(languages.original_text)
+    groups = engine.requirement_groups(languages)
+    assert len(groups) == 1, groups
+    evidence = engine.ResumeEvidence(
+        experience_text="Developed an ETL workflow using Python (Pandas, NumPy).",
+        skills=("Python", "SQL"))
+    match = engine.classify_requirement(languages, redwood["master"], evidence)
+    assert match.verdict == "strong_match"
+    assert "Python" in match.evidence
+    for absent in ("Java ", "C++", "JavaScript", "TypeScript"):
+        assert absent not in match.evidence
+
+
+def test_redwood_onsite_cadence_is_logistics_not_a_capability(redwood):
+    onsite = _redwood_requirement(redwood, "2 days per week")
+    assert onsite.kind == "logistics"
+    assert onsite.scored is False
+    assert onsite in engine.manual_review_requirements(redwood["requirements"])
+    assert onsite not in engine.scored_requirements(redwood["requirements"])
+    # a location cadence must never collect technical evidence
+    assert onsite.terms == (), onsite.terms
+
+
+def test_redwood_graduation_year_alternatives_resolve_to_meets(redwood):
+    window = engine.graduation_requirement(redwood["jd"].text)
+    assert window and window["low"] == (2026, 1) and window["high"] == (2027, 12)
+    status, details, _ = engine.eligibility_assessment(
+        redwood["requirements"], redwood["master"], redwood["jd"].text)
+    assert status == "meets"
+    # Derived from the master, never hardcoded: the graduation date lives there.
+    expected = engine.expected_graduation(redwood["master"])
+    assert expected and window["low"] <= expected <= window["high"]
+    assert any("falls inside" in d for d in details), details
+
+
+@pytest.mark.parametrize("phrasing, low, high", [
+    ("graduating in 2026 or 2027", (2026, 1), (2027, 12)),
+    ("graduating in 2026/2027", (2026, 1), (2027, 12)),
+    ("graduating in either 2026 or 2027", (2026, 1), (2027, 12)),
+])
+def test_graduation_year_alternative_grammars(phrasing, low, high):
+    window = engine.graduation_requirement(f"Candidates {phrasing} are eligible.")
+    assert window and window["low"] == low and window["high"] == high
+
+
+def test_month_range_graduation_still_wins(redwood):
+    """The New Grad month window must not be shadowed by the year form."""
+    text = "graduating between December 2026 and June 2027"
+    window = engine.graduation_requirement(text)
+    assert window["low"] == (2026, 12) and window["high"] == (2027, 6)
+
+
+def test_distributed_systems_cannot_be_claimed_as_experience(redwood):
+    """The exact Redwood cover-letter failure."""
+    evidence = engine.ResumeEvidence(
+        experience_text="Built a fuzzy-matching combinator engine.",
+        project_bullets=(("lms", "Implemented a real-time subsystem using Redis."),),
+        skills=("Python", "SQL", "ReactJS"))
+    unsupported = engine.unsupported_jd_concepts(
+        redwood["requirements"], redwood["master"], evidence)
+    assert any("distributed systems" == c.lower() for c in unsupported), unsupported
+
+    failing = ("My experience building fault-tolerant pipelines and real-time distributed "
+               "systems matches the need to ship production-grade code.")
+    problems = grounding.unsupported_ownership(failing, unsupported, company="Superhuman")
+    assert problems and "distributed systems" in problems[0].message
+
+    grounded = ("My experience building real-time backend systems matches the need to ship "
+                "production-grade code.")
+    assert grounding.unsupported_ownership(grounded, unsupported,
+                                           company="Superhuman") == []
+
+    employer = "Superhuman builds large-scale distributed systems that stay highly available."
+    assert grounding.unsupported_ownership(employer, unsupported,
+                                           company="Superhuman") == []
+
+
+def test_unsupported_gate_does_not_ban_supported_wording(redwood):
+    """Only unsupported concepts are gated; Python stays claimable."""
+    evidence = engine.ResumeEvidence(
+        experience_text="Developed an ETL workflow using Python.", skills=("Python",))
+    unsupported = engine.unsupported_jd_concepts(
+        redwood["requirements"], redwood["master"], evidence)
+    assert not any(c.lower() == "python" for c in unsupported), unsupported
+    assert grounding.unsupported_ownership(
+        "I built an ETL workflow in Python.", unsupported, company="Superhuman") == []
+
+
+def test_react_in_a_jd_names_the_supported_reactjs_skill(redwood):
+    """"React" and "ReactJS" are the same library, differently spelled."""
+    jd_text = redwood["jd"].text
+    assert "React" in jd_text and "ReactJS" not in jd_text
+    assert engine._names_skill(jd_text, "ReactJS")
+    web = _redwood_requirement(redwood, "Experience with web tech")
+    assert "ReactJS" in web.terms
+    # neighbours the master does not support are never invented
+    master = redwood["master"]
+    assert master.canonical_skill("Node.js") is None
+    assert master.canonical_skill("TypeScript") is None
+
+
+# ---- Z. C3 real-JD defects -----------------------------------------------
+
+C3_JD = ROOT / "jobs" / "c3.txt"
+
+
+@pytest.fixture(scope="session")
+def c3() -> dict:
+    master = engine.load_master()
+    jd = engine.read_jd(C3_JD)
+    return {"master": master, "jd": jd,
+            "requirements": engine.extract_jd_requirements(jd.text, master)}
+
+
+def test_c3_title_from_as_a_role_you_will(c3):
+    """"As an Forward Deployed Engineer, you will design ..." (sic)."""
+    assert c3["jd"].company_name == "C3 AI"
+    assert c3["jd"].job_title == "Forward Deployed Engineer"
+
+
+@pytest.mark.parametrize("sentence, expected", [
+    ("As a Platform Engineer, you will build services.", "Platform Engineer"),
+    ("As an Forward Deployed Engineer, you will design apps.", "Forward Deployed Engineer"),
+    ("As a Data Scientist, you'll model demand.", "Data Scientist"),
+    ("As an Analytics Developer, you are expected to ship.", "Analytics Developer"),
+])
+def test_role_comma_title_is_generic(sentence, expected):
+    assert engine._role_comma_title(sentence) == expected
+
+
+def test_role_comma_title_does_not_hijack_role_at_postings():
+    """"As a software developer at Epic, you'll ..." belongs to the role-at rule."""
+    assert engine._role_comma_title("As a software developer at Epic, you'll write code.") is None
+    epic = engine.read_jd(ROOT / "jobs" / "epic.txt")
+    assert epic.company_name == "Epic" and epic.job_title == "Software Developer"
+
+
+@pytest.mark.parametrize("lines, fill, better_than", [
+    (2, 16.0, (1, 95.0)),
+    (2, 44.0, (2, 16.0)),
+    (2, 16.0, (3, 50.0)),
+])
+def test_two_lines_always_outrank_one_line(lines, fill, better_than):
+    """A thin two-line tail beats a single line, so repair cannot degrade it."""
+    rank = run_pipeline._bullet_rank(lines, fill, 2, 20.0)
+    worse = run_pipeline._bullet_rank(better_than[0], better_than[1], 2, 20.0)
+    assert rank > worse, (rank, worse)
+
+
+def test_a_thin_tail_asks_to_expand_not_shorten():
+    """The exact C3 failure: fraud#2 at 2 lines / 16% chose shorten."""
+    class _Measured:
+        def __init__(self, lines, fill):
+            self.lines, self.fill_pct = lines, fill
+
+        def verdict(self, orphan, acceptable, ideal):
+            if self.lines == 1:
+                return "single_line"
+            return "hard_orphan" if self.fill_pct < orphan else "ideal"
+
+    policy = engine.load_policy()
+    render = engine.ProjectRender(engine.load_master().project("fraud"), ["a", "b"])
+    problems = run_pipeline._layout_problems(
+        [_Measured(2, 44.0), _Measured(2, 16.0)], [render], policy, 1)
+    goals = [a["goal"] for a in problems["actions"]]
+    assert goals == ["lengthen"], problems["actions"]
+    assert "more of this project's evidence" in problems["actions"][0]["reason"]
+
+
+def test_restore_best_undoes_a_degrading_repair():
+    """2L/16% -> repaired to 1L must not be the stored bullet."""
+    import logging
+
+    master = engine.load_master()
+    render = engine.ProjectRender(master.project("fraud"), ["good two-line text"])
+    best = {}
+    run_pipeline._track_best(
+        best, [type("M", (), {"lines": 2, "fill_pct": 16.0})()], [render],
+        engine.load_policy())
+    assert best[("fraud", 0)][1] == "good two-line text"
+
+    # a repair degrades it to a single line
+    render.bullets[0] = "degraded one-line text"
+    run_pipeline._track_best(
+        best, [type("M", (), {"lines": 1, "fill_pct": 95.0})()], [render],
+        engine.load_policy())
+    assert best[("fraud", 0)][1] == "good two-line text", "the 1-line text must not win"
+
+    run_pipeline._restore_best(
+        best, [render], run_pipeline.StageLog(logging.getLogger("t"), "T"))
+    assert render.bullets[0] == "good two-line text"
+
+
+@pytest.fixture(scope="session")
+def capsules(c3) -> dict:
+    return engine.source_capsules(c3["master"])
+
+
+@pytest.mark.parametrize("paragraph, why", [
+    ("I engineered an OCR pipeline with Tesseract-OCR and Qwen-VL. The solution runs on "
+     "AWS EC2 and RDS.", "EC2/RDS belongs to the cloud role, not HeinOnline"),
+    ("I engineered an OCR pipeline with Tesseract-OCR raising accuracy to 90.81% through "
+     "unit testing.", "unit testing has no HeinOnline evidence"),
+])
+def test_cross_source_attribution_fails(c3, capsules, paragraph, why):
+    problems = grounding.validate_source_scope(paragraph, capsules, c3["master"])
+    assert problems, why
+
+
+@pytest.mark.parametrize("paragraph", [
+    "I engineered an OCR pipeline with Tesseract-OCR and Qwen models across CrossRef "
+    "sources, raising extraction accuracy to 90.81%.",
+    "I designed and deployed scalable AWS EC2 and RDS infrastructure with VPC networking.",
+    "I load-tested the API with Locust, cutting p95 latency by approximately 26%.",
+])
+def test_single_source_paragraphs_still_pass(c3, capsules, paragraph):
+    assert grounding.validate_source_scope(paragraph, capsules, c3["master"]) == []
+
+
+def test_profiling_is_not_claimable_when_only_load_testing_exists(c3):
+    """The master says load testing is not profiling."""
+    evidence = engine.ResumeEvidence(
+        experience_text="Load-tested the API with Locust.",
+        skills=("Python", "Load Testing"))
+    unsupported = engine.unsupported_jd_concepts(
+        c3["requirements"], c3["master"], evidence)
+    assert any("profil" in c.lower() for c in unsupported), unsupported
+    claim = ("This project showcases my React expertise and systematic performance "
+             "profiling.")
+    assert grounding.unsupported_ownership(claim, unsupported, company="C3 AI")
+    # load testing itself stays claimable
+    assert grounding.unsupported_ownership(
+        "I load-tested the API with Locust.", unsupported, company="C3 AI") == []
+
+
+def test_c3_prose_graduation_gate_is_found_and_routed_to_manual(c3):
+    """A standalone prose sentence, not a bullet."""
+    gates = engine.graduation_gate_sentences(c3["jd"].text)
+    assert gates and "December 2026 or Summer/Fall 2027" in gates[0]
+    window = engine.graduation_requirement(c3["jd"].text)
+    assert window and window["options"] == [((2026, 12), (2026, 12)),
+                                            ((2027, 6), (2027, 12))]
+    eligibility = [r for r in c3["requirements"] if r.kind == "eligibility"]
+    assert eligibility, "the gate must become an eligibility requirement"
+    assert all(not r.scored for r in eligibility)
+
+    status, details, flags = engine.eligibility_assessment(
+        c3["requirements"], c3["master"], c3["jd"].text)
+    assert status == "uncertain", (status, details)
+    assert any("conferral" in d for d in details)
+    assert flags
+
+
+def test_simpler_graduation_cases_keep_their_exact_resolution():
+    master = engine.load_master()
+    for path in (REDWOOD_JD, ROOT / "jobs_synthetic" / "newgrad_swe.txt"):
+        jd = engine.read_jd(path)
+        requirements = engine.extract_jd_requirements(jd.text, master)
+        status, _, _ = engine.eligibility_assessment(requirements, master, jd.text)
+        assert status == "meets", (path.name, status)
+
+
+# ---- AA. Candidate education / work-authorization dates ------------------
+
+@pytest.mark.parametrize("sentence", [
+    "I expect to graduate in December 2026.",
+    "I finish my Master's in December 2026.",
+    "I can start full time in January 2027 under OPT.",
+    "I can begin OPT work immediately after graduating in December 2026.",
+    # the exact sentence my own C3 mock shipped
+    "I finish my Master of Science in Computer Science at the University at Buffalo in "
+    "December 2026 and can start full time in January 2027 under OPT.",
+])
+def test_unsupported_candidate_dates_are_rejected(sentence):
+    master = engine.load_master()
+    problems = grounding.validate_candidate_dates(sentence, master)
+    assert problems, sentence
+    assert all(p.kind == "candidate_date" for p in problems)
+
+
+@pytest.mark.parametrize("sentence", [
+    "I expect to graduate in February 2027.",
+    "I am completing an M.S. in Computer Science at the University at Buffalo.",
+    "I am eligible to begin post-completion OPT employment from February 2, 2027, "
+    "subject to OPT/EAD authorization.",
+    "I am completing an M.S. in Computer Science at the University at Buffalo, expected "
+    "February 2027, after earning a B.E. in Information Technology.",
+])
+def test_supported_candidate_dates_pass(sentence):
+    master = engine.load_master()
+    assert grounding.validate_candidate_dates(sentence, master) == [], sentence
+
+
+def test_employer_graduation_window_is_still_quotable():
+    """The JD's own eligibility window is the employer's date, not a claim."""
+    master = engine.load_master()
+    jd_sentence = ("The role is open to candidates graduating in December 2026 or "
+                   "Summer/Fall 2027.")
+    assert grounding.validate_candidate_dates(jd_sentence, master) == []
+
+
+def test_jd_and_candidate_dates_stay_separately_attributed():
+    """Both dates in one paragraph: the JD's window and the candidate's own."""
+    master = engine.load_master()
+    paragraph = ("The role is open to candidates graduating in December 2026 or "
+                 "Summer/Fall 2027. I expect to graduate in February 2027.")
+    assert grounding.validate_candidate_dates(paragraph, master) == []
+    # swapping the candidate's date for the JD's must fail
+    swapped = ("The role is open to candidates graduating in December 2026 or "
+               "Summer/Fall 2027. I expect to graduate in December 2026.")
+    assert grounding.validate_candidate_dates(swapped, master)
+
+
+def test_opt_without_its_authorization_qualifier_is_rejected():
+    master = engine.load_master()
+    bare = "I will be eligible for OPT from February 2027."
+    problems = grounding.validate_candidate_dates(bare, master)
+    assert any("qualifier" in p.message for p in problems), [p.message for p in problems]
+
+
+def test_the_letter_prompt_forbids_deriving_candidate_dates_from_the_jd():
+    import llm_client
+    rules = llm_client._LETTER_RULES
+    assert "CANDIDATE DATES COME ONLY FROM THE STANDING FACTS" in rules
+    assert "Never infer an" in rules and "OPT start date" in rules
+    assert "expected February 2027" in rules
+
+
+def test_the_mock_eligibility_sentence_is_grounded():
+    """The fixture was updated only after the validator rejected the old text."""
+    import logging
+
+    import llm_client
+    master = engine.load_master()
+    transport = llm_client.MockTransport(master, logging.getLogger("test"))
+    letter = transport._letter({"job_title": "Forward Deployed Engineer",
+                                "company": "C3 AI", "project_ids": ["lms"],
+                                "jd_text": "graduating in December 2026 or Fall 2027",
+                                "needs_eligibility": True, "themes": []})
+    assert "December 2026" not in letter
+    assert "January 2027" not in letter
+    assert "OPT" not in letter
+    assert grounding.validate_candidate_dates(letter, master) == []
+
+
+# ---- AB. Role-level supplements belong to their own role -----------------
+
+def test_role_supplements_are_not_a_global_exempt_pool():
+    master = engine.load_master()
+    prefixes = engine.role_bullet_prefixes(master)
+    assert prefixes["Graduate Student Developer (CSE 611 Project)"] == "GSD"
+    assert prefixes["Software Engineer"] == "SWE"
+
+    capsules = engine.source_capsules(master)
+    assert "role:Graduate" not in capsules and "role:Software" not in capsules
+    # the supplement's own facts now live with their role
+    assert "reproducible execution" in capsules["role:GSD"]
+    assert "technical interviews" in capsules["role:SWE"]
+
+
+def test_a_gsd_supplement_fact_cannot_be_attributed_to_thesis():
+    """Anchors from a role supplement now identify that role, not "general"."""
+    master = engine.load_master()
+    capsules = engine.source_capsules(master)
+    anchors = grounding._source_anchors(capsules, master)
+    assert anchors.get("Agile") == "role:SWE", "an SWE supplement fact must anchor to SWE"
+
+    mixed = ("I processed 47 law journals raising accuracy to 90.81% while working in "
+             "Agile sprints and conducting 20+ technical interviews.")
+    problems = grounding.validate_source_scope(mixed, capsules, master)
+    assert problems, "a GSD metric plus an SWE supplement fact must be cross-source"
+    assert "role:GSD" in problems[0].message and "role:SWE" in problems[0].message
+
+
+# ---- AC. Provider default, compact assessment, artifact hygiene ----------
+
+def test_no_groq_model_never_resolves_to_the_removed_default(monkeypatch):
+    """An unset GROQ_MODEL must not resurrect openai/gpt-oss-120b."""
+    import importlib
+    import resume_engine
+
+    monkeypatch.delenv("GROQ_MODEL", raising=False)
+    reloaded = importlib.reload(resume_engine)
+    try:
+        assert reloaded.GROQ_MODEL == ""
+        assert "gpt-oss" not in (reloaded.GROQ_MODEL or "")
+    finally:
+        importlib.reload(resume_engine)
+
+
+def test_groq_transport_without_a_model_is_unavailable_and_falls_back():
+    import logging
+
+    import llm_client
+    master = engine.load_master()
+    credentials = engine.load_credentials()
+    gemini = llm_client.GeminiTransport(credentials, logging.getLogger("t"))
+    groq = llm_client.GroqTransport(credentials, logging.getLogger("t"), model="",
+                                    fallback=gemini)
+    assert groq.available is False
+    lonely = llm_client.GroqTransport(credentials, logging.getLogger("t"), model="",
+                                      fallback=None)
+    with pytest.raises(llm_client.ProviderError) as caught:
+        lonely.generate(llm_client.Request("assessment", "x"))
+    assert "no Groq model is configured" in str(caught.value)
+    assert master is not None
+
+
+class _Verified:
+    experience_exact = True
+    issues: list = []
+    pages = 1
+    action_verbs_ok = True
+
+
+def _research(jd_text: str, **overrides) -> dict:
+    """Company research exactly as production computes it.
+
+    The provider answers UNKNOWN (mock mode cannot browse) and Python applies
+    the deterministic rules: explicit posting language, the E-Verify rule and
+    the job-level override.
+    """
+    payload = {"company_visa_sponsorship": "UNKNOWN", "company_visa_confidence": "LOW",
+               "company_stem_opt_support": "UNKNOWN", "company_stem_opt_confidence": "LOW",
+               "job_posted": "UNKNOWN", "job_posted_confidence": "LOW",
+               "checked_at": "2026-09-15", "sources": []}
+    payload.update(overrides)
+    research, _ = grounding.validate_company_research(
+        payload, jd_text=jd_text, jd_posted=grounding.job_posted_date(jd_text))
+    return research
+
+
+def _report(jd_text: str = "A posting with no dates or sponsorship language.",
+            **kwargs) -> dict:
+    base = dict(application_audit={"experience_selection_score": 8.7,
+                                   "resume_tailoring_score": 9.5,
+                                   "project_selection_score": 8.5,
+                                   "project_bullet_score": 8.5,
+                                   "callback_likelihood": "MEDIUM",
+                                   "fit_score": 8.2},
+                research=_research(jd_text), letter_score=9.5)
+    base.update(kwargs)
+    return grounding.audit_report(**base)
+
+
+def test_assessment_txt_holds_exactly_the_agreed_fields():
+    body = grounding.render_assessment_txt(_report())
+    lines = [line for line in body.splitlines() if line.strip()]
+    assert [line.split(":")[0] for line in lines] == list(grounding.ASSESSMENT_FIELDS)
+    for banned in ("strong_matches", "partial_matches", "gaps",
+                   "complementary_strengths", "model_summary", "requirement_id", "{",
+                   "confidence", "http", "component"):
+        assert banned not in body
+
+
+def test_unknown_sponsorship_stays_unknown_when_the_jd_is_silent():
+    assert _report()["Company Visa Sponsorship"] == "UNKNOWN"
+
+
+@pytest.mark.parametrize("phrase, expected", [
+    ("We do not offer visa sponsorship for this position.", "NO"),
+    ("Unable to sponsor visas at this time.", "NO"),
+    ("Visa sponsorship is available for this role.", "YES"),
+    ("Nothing about work authorization here.", "UNKNOWN"),
+])
+def test_explicit_sponsorship_language_only(phrase, expected):
+    assert _report(phrase)["Company Visa Sponsorship"] == expected
+
+
+def test_stem_opt_is_unknown_without_evidence_and_never_inferred():
+    """E-Verify participation must not imply a STEM OPT conclusion."""
+    assert _report()["Company STEM OPT Support"] == "UNKNOWN"
+    everify = _report("We participate in the US federal E-Verify program.")
+    assert everify["Company STEM OPT Support"] == "UNKNOWN"
+    assert _report("This employer supports the STEM OPT extension."
+                   )["Company STEM OPT Support"] == "YES"
+
+
+@pytest.mark.parametrize("jd_text, expected", [
+    ("No timestamp anywhere in this posting.", "UNKNOWN"),
+    ("Posted on March 4, 2026 by the hiring team.", "2026-03-04"),
+    ("Published: 2026-03-04", "2026-03-04"),
+])
+def test_job_posted_only_from_real_evidence(jd_text, expected):
+    assert _report(jd_text)["Job Posted"] == expected
+
+
+def test_job_posted_never_substitutes_a_local_timestamp(tmp_path):
+    """No file mtime, run time or download time may stand in for a posting date."""
+    report = _report("A posting with no date at all.")
+    assert report["Job Posted"] == "UNKNOWN"
+    assert str(engine.date.today().year) not in report["Job Posted"]
+    # Nor may a researched value that is merely today's date pass as evidence
+    # when the posting itself says nothing: it must still be a real claim.
+    today = engine.date.today().isoformat()
+    assert _research("A posting with no date at all.",
+                     job_posted=today)["job_posted"] == today
+    assert _research("A posting with no date at all.",
+                     job_posted="not a date")["job_posted"] == "UNKNOWN"
+
+
+def test_callback_likelihood_is_one_field_and_never_a_percentage():
+    report = _report()
+    assert report["Callback Likelihood"] in grounding.CALLBACK_LIKELIHOOD
+    body = grounding.render_assessment_txt(report)
+    assert "%" not in body
+    assert not re.search(r"\d+\s*(?:percent|probability|chance)", body, re.IGNORECASE)
+    assert body.count("Callback") == 1
+    # An absent or malformed provider value degrades, never guesses.
+    assert _report(application_audit={})["Callback Likelihood"] == "UNKNOWN"
+    audit, _ = grounding.validate_application_audit({"callback_likelihood": "72%"})
+    assert audit["callback_likelihood"] == "UNKNOWN"
+
+
+def test_the_report_is_advisory_when_an_audit_is_unavailable():
+    report = _report(application_audit={})
+    assert report["Fit Match Score"] == "UNKNOWN"
+    assert report["Resume Tailoring Score"] == "UNKNOWN"
+    assert report["Experience Selection Score"] == "UNKNOWN"
+    assert report["Callback Likelihood"] == "UNKNOWN"
+    # The deterministic half still scores: it needs no provider at all.
+    assert report["Cover Letter Score"] == "9.5 / 10"
+
+
+def test_final_pdf_is_named_company_and_title():
+    jd = engine.read_jd(C3_JD)
+    assert run_pipeline.final_pdf_name(jd) == "C3_AI_Forward_Deployed_Engineer.pdf"
+    assert engine.date.today().isoformat() not in run_pipeline.final_pdf_name(jd)
+
+
+def test_success_removes_latex_junk_but_keeps_run_log(tmp_path):
+    import logging
+
+    jd = engine.read_jd(C3_JD)
+    for name in ("resume.pdf", "resume.aux", "resume.log", "resume.out", "run.log",
+                 "resume.tex", "resume.txt", "assessment.json"):
+        (tmp_path / name).write_text("x")
+    final = run_pipeline.finalize_artifacts(
+        tmp_path, jd, run_pipeline.StageLog(logging.getLogger("t"), "T"))
+
+    assert final and final.name == "C3_AI_Forward_Deployed_Engineer.pdf"
+    assert final.exists()
+    assert not (tmp_path / "resume.pdf").exists()
+    for gone in ("resume.aux", "resume.log", "resume.out", "assessment.json"):
+        assert not (tmp_path / gone).exists(), gone
+    for kept in ("run.log", "resume.tex", "resume.txt"):
+        assert (tmp_path / kept).exists(), kept
+    assert len(list(tmp_path.glob("*.pdf"))) == 1
+
+
+def test_required_artifacts_describe_the_new_contract():
+    assert "assessment.txt" in run_pipeline.REQUIRED_ARTIFACTS
+    assert "assessment.json" not in run_pipeline.REQUIRED_ARTIFACTS
+    assert "resume.pdf" not in run_pipeline.REQUIRED_ARTIFACTS
+    assert "run.log" in run_pipeline.REQUIRED_ARTIFACTS
+
+
+def test_a_failed_run_keeps_latex_diagnostics(tmp_path):
+    """finalize_artifacts is only reached on success, so junk survives a failure."""
+    for name in ("resume.pdf", "resume.aux", "resume.log", "resume.out", "run.log"):
+        (tmp_path / name).write_text("x")
+    # needs_review path: finalize_artifacts is never called
+    for kept in ("resume.pdf", "resume.aux", "resume.log", "resume.out", "run.log"):
+        assert (tmp_path / kept).exists(), kept
+    source = Path(run_pipeline.__file__).read_text()
+    guard = source.split("final_pdf = finalize_artifacts")[0]
+    assert guard.rstrip().endswith('if status == "success":'), \
+        "cleanup must be gated on success"
+
+
+def test_revalidate_accepts_the_renamed_final_pdf():
+    """Revalidation must not assume the PDF is called resume.pdf."""
+    source = Path(run_pipeline.__file__).read_text()
+    revalidate = source.split("def revalidate(")[1]
+    assert 'run_dir.glob("*.pdf")' in revalidate
+    folders = sorted((ROOT / "output" / "_smoke_tests").glob("C3_AI_*"))
+    if not folders:
+        pytest.skip("no C3 smoke folder present")
+    run_dir = folders[-1]
+    if not list(run_dir.glob("*.pdf")):
+        pytest.skip("the C3 smoke folder holds no PDF")
+    assert not (run_dir / "resume.pdf").exists()
+    result = run_pipeline.revalidate(run_dir, console=False)
+    assert result.status == "success", result.issues
+
+
+# ============================================================ AD. cover-letter
+# distinctive priorities: choosing the MOST DISTINCTIVE supported evidence.
+#
+# Every letter under review was true and still led with the wrong evidence: a
+# forward-deployed posting got a backend paragraph. These tests pin the
+# selection behaviour AND the scope freeze around it - the resume engine must
+# be untouched by all of it.
+
+# The resume decisions recorded from the four real-JD mocks BEFORE this patch.
+# Cover-letter evidence selection may not move any of them.
+PRE_PATCH_RESUME_DECISIONS = {
+    "BAE_Systems_Entry_Level_Software_Engineer": {
+        "section_order": ["Experience", "Education", "Academic Projects",
+                          "Technical Skills"],
+        "shipped_ids": ["GSD-1", "GSD-2", "GSD-3", "SWE-1", "SWE-2", "SWE-3",
+                        "SWE-ALT-DOCKER", "SWE-5", "CLOUD-1", "CLOUD-2", "DATA-1"],
+        "selected_by_relevance": ["lms", "pintos", "tailor_pipeline"],
+        "display_order": ["tailor_pipeline", "lms", "pintos"],
+        "allocation": {"lms": 3, "pintos": 2, "tailor_pipeline": 2},
+        "pages": 1,
+    },
+    "C3_AI_Forward_Deployed_Engineer": {
+        "section_order": ["Education", "Experience", "Academic Projects",
+                          "Technical Skills"],
+        "shipped_ids": ["GSD-1", "GSD-2", "GSD-3", "SWE-1", "SWE-2", "SWE-3",
+                        "SWE-ALT-DOCKER", "SWE-5", "CLOUD-1", "CLOUD-2", "DATA-1"],
+        "selected_by_relevance": ["lms", "pintos", "temp"],
+        "display_order": ["lms", "pintos", "temp"],
+        "allocation": {"lms": 3, "pintos": 2, "temp": 2},
+        "pages": 1,
+    },
+    "Epic_Software_Developer": {
+        "section_order": ["Experience", "Education", "Academic Projects",
+                          "Technical Skills"],
+        "shipped_ids": ["GSD-1", "GSD-2", "GSD-3", "SWE-1", "SWE-2", "SWE-3",
+                        "SWE-4", "SWE-5", "CLOUD-1", "CLOUD-2", "DATA-1"],
+        "selected_by_relevance": ["pintos", "lms", "fraud"],
+        "display_order": ["lms", "pintos", "fraud"],
+        "allocation": {"pintos": 3, "lms": 2, "fraud": 2},
+        "pages": 1,
+    },
+    "Superhuman_Software_Engineer_Early_Career": {
+        "section_order": ["Education", "Experience", "Academic Projects",
+                          "Technical Skills"],
+        "shipped_ids": ["GSD-1", "GSD-2", "GSD-3", "SWE-1", "SWE-2", "SWE-3",
+                        "SWE-ALT-DOCKER", "SWE-5", "CLOUD-1", "CLOUD-2", "DATA-1"],
+        "selected_by_relevance": ["lms", "temp", "pintos"],
+        "display_order": ["lms", "pintos", "temp"],
+        "allocation": {"lms": 3, "temp": 2, "pintos": 2},
+        "pages": 1,
+    },
+}
+
+
+def _priorities_for(jd_path: Path, chosen_ids: list[str]) -> list[dict]:
+    """Derive the letter priorities exactly as run_pipeline does."""
+    master = engine.load_master()
+    jd = engine.read_jd(jd_path)
+    requirements = engine.extract_jd_requirements(jd.text, master)
+    projects = [p for p in master.projects if p.project_id in chosen_ids]
+    capsules = engine.source_capsules(master, projects)
+    return grounding.letter_priorities(
+        jd_text=jd.text, job_title=jd.job_title or "", requirements=requirements,
+        capsules=capsules, master=master, on_resume=chosen_ids)
+
+
+# ---- A. the resume engine is not part of this feature ----------------------
+
+def test_a_the_priority_feature_never_reaches_the_resume_engine():
+    """Scope freeze: evidence SELECTION lives outside the frozen modules."""
+    frozen = {"resume_engine.py": engine, "pdf_utils.py": pdf}
+    leaked = ("letter_priorities", "DISTINCTIVE_THEMES", "cover_letter_score",
+              "priority_addressed", "letter_relevance", "MOCK_THEME_PARAGRAPHS")
+    for name, module in frozen.items():
+        source = Path(module.__file__).read_text(encoding="utf-8")
+        for symbol in leaked:
+            assert symbol not in source, f"{symbol} leaked into {name}"
+        for symbol in leaked:
+            assert not hasattr(module, symbol), f"{name} exposes {symbol}"
+
+
+def test_a_priority_derivation_mutates_none_of_its_inputs():
+    """Read-only over requirements and capsules, so no resume input can shift."""
+    master = engine.load_master()
+    jd = engine.read_jd(C3_JD)
+    requirements = engine.extract_jd_requirements(jd.text, master)
+    capsules = engine.source_capsules(master, list(master.projects)[:3])
+    before_reqs = [dataclasses.asdict(r) for r in requirements]
+    before_caps = dict(capsules)
+    grounding.letter_priorities(jd_text=jd.text, job_title=jd.job_title,
+                               requirements=requirements, capsules=capsules,
+                               master=master, on_resume=["lms"])
+    assert [dataclasses.asdict(r) for r in requirements] == before_reqs
+    assert capsules == before_caps
+
+
+# ---- B. the four real JDs produce the same resume as before -----------------
+
+@pytest.mark.parametrize("folder", sorted(PRE_PATCH_RESUME_DECISIONS))
+def test_b_real_jd_resume_decisions_are_unchanged(folder):
+    """Section order, Experience IDs, projects, allocation, Skills, pages."""
+    candidates = sorted((ROOT / "output" / "_smoke_tests").glob(folder + "_*"))
+    if not candidates:
+        pytest.skip(f"no recorded mock run for {folder}; run the four real-JD mocks")
+    strategy = json.loads((candidates[-1] / "strategy.json").read_text(encoding="utf-8"))
+    expected = PRE_PATCH_RESUME_DECISIONS[folder]
+
+    assert strategy["section_order"] == expected["section_order"]
+    assert strategy["experience"]["shipped_ids"] == expected["shipped_ids"]
+    assert strategy["projects"]["selected_by_relevance"] == expected["selected_by_relevance"]
+    assert strategy["projects"]["display_order"] == expected["display_order"]
+    assert strategy["projects"]["allocation"] == expected["allocation"]
+    assert strategy["verification"]["pages"] == expected["pages"]
+    # Skills are compared as the rendered lines, which is what the PDF shows.
+    assert len(strategy["skills"]["rendered"]) == 5
+    assert strategy["skills"]["rendered"][0].startswith("Languages & Databases:")
+
+
+# ---- C. a badly prioritized C3 letter scores below a well prioritized one ---
+
+_C3_CHOSEN = ["lms", "pintos", "temp"]
+
+_C3_GROUNDED_BUT_MISPRIORITIZED = """Dear Hiring Manager,
+
+I am applying for the Forward Deployed Engineer role at C3 AI. My background is
+Python backend services and databases.
+
+At Thesis Mumbai Tech I built healthcare modules supporting 10k+ records and
+designed a real-time WebSocket and Redis pipeline feeding IoT sensor data into
+PostgreSQL, and I architected the relational schemas and SQL queries behind
+those services with indexing and query tuning to keep reads predictable.
+
+Outside work I implemented the user-programs layer of Pintos, an x86 teaching
+kernel written in C, covering process execution and a system-call handler.
+
+Sincerely,
+Jay Niketan Pathare"""
+
+_C3_WELL_PRIORITIZED = """Dear Hiring Manager,
+
+I am applying for the Forward Deployed Engineer role at C3 AI. My background is
+Python backend services delivered directly with the people who use them.
+
+At Thesis Mumbai Tech I led platform module delivery end to end, gathering
+requirements in client meetings, clarifying scope with stakeholders, building
+prototypes to validate it and translating the result into technical
+specifications the team could implement.
+
+Outside work I implemented the user-programs layer of Pintos, an x86 teaching
+kernel written in C, covering process execution and a system-call handler.
+
+Sincerely,
+Jay Niketan Pathare"""
+
+
+def test_c_c3_primary_priority_is_customer_facing_delivery():
+    """The Forward Deployed title and the JD's demos/training make it primary."""
+    priorities = _priorities_for(C3_JD, _C3_CHOSEN)
+    top = grounding.supported_priorities(priorities)[0]
+    assert top["theme"] == "customer_facing"
+    assert top["source"] == "role:SWE"
+    assert any("client" in term or "requirements" in term
+               for term in top["evidence_terms"]), top["evidence_terms"]
+
+
+def test_c_ignoring_customer_facing_evidence_costs_relevance_and_score():
+    priorities = _priorities_for(C3_JD, _C3_CHOSEN)
+    bad = grounding.letter_relevance(_C3_GROUNDED_BUT_MISPRIORITIZED, priorities)
+    good = grounding.letter_relevance(_C3_WELL_PRIORITIZED, priorities)
+
+    assert bad and bad[0].kind == "relevance"
+    assert bad[0].severity == "warning", "a true letter is never rejected for this"
+    assert "customer-facing delivery" in bad[0].message
+    assert good == []
+
+    common = dict(problems=[], priorities=priorities, themes_covered=2,
+                  evidence_sources=2, named_terms_covered=2,
+                  company="C3 AI", job_title="Forward Deployed Engineer")
+    bad_score = grounding.cover_letter_score(
+        letter=_C3_GROUNDED_BUT_MISPRIORITIZED,
+        words=grounding.word_count(_C3_GROUNDED_BUT_MISPRIORITIZED), **common)
+    good_score = grounding.cover_letter_score(
+        letter=_C3_WELL_PRIORITIZED,
+        words=grounding.word_count(_C3_WELL_PRIORITIZED), **common)
+    assert good_score > bad_score, (good_score, bad_score)
+    assert bad_score < 9.5, "ignoring the defining requirement cannot score 9.5"
+
+
+# ---- D. Superhuman prefers the AI-native evidence --------------------------
+
+_SUPERHUMAN_CHOSEN = ["lms", "temp", "pintos"]
+
+_SUPERHUMAN_BACKEND_ONLY = """Dear Hiring Manager,
+
+I am applying for the Software Engineer, Early Career role at Superhuman.
+
+At Thesis Mumbai Tech I designed a real-time WebSocket and Redis pipeline
+feeding IoT sensor data into PostgreSQL, and architected the relational schemas
+and SQL queries behind those services.
+
+Outside work I built a decoupled learning management system whose real-time
+layer runs on Django Channels, Daphne, Redis and WebSockets.
+
+Sincerely,
+Jay Niketan Pathare"""
+
+_SUPERHUMAN_AI_NATIVE = """Dear Hiring Manager,
+
+I am applying for the Software Engineer, Early Career role at Superhuman.
+
+At Thesis Mumbai Tech I designed a real-time WebSocket and Redis pipeline
+feeding IoT sensor data into PostgreSQL, and architected the relational schemas
+and SQL queries behind those services.
+
+I work with AI coding agents day to day rather than around them: GitHub Copilot
+for code generation and completion, and Cursor and Claude Code for
+repository-level development, debugging, test-driven iteration and code review.
+
+Sincerely,
+Jay Niketan Pathare"""
+
+
+def test_d_superhuman_primary_priority_is_ai_native_development():
+    priorities = _priorities_for(REDWOOD_JD, _SUPERHUMAN_CHOSEN)
+    top = grounding.supported_priorities(priorities)[0]
+    assert top["theme"] == "ai_native"
+    # The supporting evidence is the skills bank, not an invented project.
+    assert top["source"] == "general"
+    assert "claude code" in top["evidence_terms"]
+    assert "cursor" in top["evidence_terms"]
+
+
+def test_d_ai_native_evidence_outranks_an_equally_grounded_backend_letter():
+    priorities = _priorities_for(REDWOOD_JD, _SUPERHUMAN_CHOSEN)
+    assert grounding.letter_relevance(_SUPERHUMAN_AI_NATIVE, priorities) == []
+    assert grounding.letter_relevance(_SUPERHUMAN_BACKEND_ONLY, priorities)
+
+    common = dict(problems=[], priorities=priorities, themes_covered=2,
+                  evidence_sources=2, named_terms_covered=1,
+                  company="Superhuman", job_title="Software Engineer, Early Career")
+    ai = grounding.cover_letter_score(
+        letter=_SUPERHUMAN_AI_NATIVE,
+        words=grounding.word_count(_SUPERHUMAN_AI_NATIVE), **common)
+    backend = grounding.cover_letter_score(
+        letter=_SUPERHUMAN_BACKEND_ONLY,
+        words=grounding.word_count(_SUPERHUMAN_BACKEND_ONLY), **common)
+    assert ai > backend, (ai, backend)
+
+
+def test_d_epic_still_leads_with_healthcare_and_bae_invents_nothing():
+    """The other two real JDs keep their existing, correct emphasis."""
+    epic_top = grounding.supported_priorities(
+        _priorities_for(EPIC_JD, ["pintos", "lms", "fraud"]))[0]
+    assert epic_top["theme"] == "healthcare"
+    assert epic_top["source"] == "role:SWE"
+
+    bae = _priorities_for(BAE_JD, ["lms", "pintos", "tailor_pipeline"])
+    labels = " ".join(p["label"] for p in bae).lower()
+    evidence = " ".join(term for p in bae for term in p["evidence_terms"]).lower()
+    # None of the things the BAE posting must never be answered with.
+    for invented in ("clearance", "computer vision", "profiling", "windows",
+                     "java", "c++", "javascript"):
+        assert invented not in labels and invented not in evidence, invented
+
+
+# ---- E. an unsupported distinctive requirement stays uncovered -------------
+
+def test_e_an_unsupported_distinctive_signal_is_never_padded(tmp_path):
+    """No capsule evidence: the signal is named, then left alone."""
+    master = engine.load_master()
+    jd_text = ("Senior Kernel Engineer\n\nWe build device drivers and work on kernel "
+               "memory management and thread synchronization in the Linux kernel every "
+               "day. Systems programming and concurrency are the whole job.\n")
+    requirements = engine.extract_jd_requirements(jd_text, master)
+    # A capsule pool that supports nothing low-level at all.
+    capsules = {"role:SWE": "Built REST APIs with Django and PostgreSQL."}
+    priorities = grounding.letter_priorities(
+        jd_text=jd_text, job_title="Senior Kernel Engineer", requirements=requirements,
+        capsules=capsules, master=master, on_resume=[])
+
+    assert any(p["theme"] == "low_level_systems" for p in priorities)
+    low_level = next(p for p in priorities if p["theme"] == "low_level_systems")
+    assert low_level["supported"] is False
+    assert low_level["source"] == "" and low_level["evidence_terms"] == []
+    # It reaches neither the prompt nor the relevance check, so nothing is forced.
+    assert "low-level" not in grounding.render_letter_priorities(priorities)
+    assert grounding.letter_relevance("Dear Hiring Manager, I write Python.",
+                                      priorities) == []
+
+
+def test_e_a_posting_with_nothing_distinctive_yields_no_priorities():
+    master = engine.load_master()
+    jd_text = ("Software Engineer\n\nYou will write Python, use Git, build REST APIs "
+               "and communicate well with your team in an Agile environment.\n")
+    requirements = engine.extract_jd_requirements(jd_text, master)
+    priorities = grounding.letter_priorities(
+        jd_text=jd_text, job_title="Software Engineer", requirements=requirements,
+        capsules=engine.source_capsules(master, []), master=master)
+    assert priorities == []
+    assert grounding.render_letter_priorities(priorities) == ""
+    # A generic posting is not punished for being generic.
+    assert grounding.cover_letter_score(
+        letter="Dear Hiring Manager, I build Python services. Sincerely, Jay",
+        problems=[], words=200, priorities=priorities, themes_covered=2,
+        evidence_sources=2, named_terms_covered=1, company="", job_title="") >= 8.0
+
+
+# ---- F. generic keywords never drive any of this ---------------------------
+
+def test_f_generic_cues_can_never_become_a_priority():
+    """Python, Git, REST and communication describe every posting."""
+    for theme in grounding.DISTINCTIVE_THEMES:
+        overlap = grounding.GENERIC_CUES & set(theme.jd_cues)
+        assert not overlap, (theme.key, overlap)
+
+
+def test_f_missing_jd_keywords_alone_is_not_a_relevance_failure():
+    """The check fires on ignored distinctive evidence, not absent keywords."""
+    priorities = _priorities_for(C3_JD, _C3_CHOSEN)
+    # Names no JD technology at all, but does address the primary priority.
+    letter = ("Dear Hiring Manager,\n\nI am applying for the Forward Deployed Engineer "
+              "role at C3 AI.\n\nAt Thesis Mumbai Tech I gathered requirements in client "
+              "meetings, built prototypes to validate scope and owned delivery end to "
+              "end.\n\nSincerely,\nJay Niketan Pathare")
+    assert grounding.letter_named_terms(letter, ["Kubernetes", "Terraform", "Go"]) == []
+    assert grounding.letter_relevance(letter, priorities) == []
+
+
+def test_f_relevance_is_advisory_and_generation_validation_is_untouched():
+    """A relevance warning can lower a score; it can never block a letter."""
+    priorities = _priorities_for(C3_JD, _C3_CHOSEN)
+    problems = grounding.letter_relevance(_C3_GROUNDED_BUT_MISPRIORITIZED, priorities)
+    assert grounding.errors(problems) == []
+    import llm_client
+
+    source = Path(llm_client.__file__).read_text(encoding="utf-8")
+    loop = source.split("def cover_letter(")[1].split("def assess(")[0]
+    # Relevance only retries while attempts remain; it never reaches `blocking`.
+    assert "relevance and attempt < LETTER_ATTEMPTS" in loop
+    assert "return letter, problems + relevance" in loop
+
+
+# ---- G. the compact score reflects the agreed rubric -----------------------
+
+def test_g_blocking_validation_still_short_circuits_the_score():
+    problems = [grounding.Problem("metric", "error", "unsupported metric")]
+    assert grounding.cover_letter_score(
+        letter="x", problems=problems, words=200, priorities=[],
+        themes_covered=2, evidence_sources=2, named_terms_covered=1,
+        company="C3 AI", job_title="Forward Deployed Engineer") == 4.0
+
+
+def test_g_a_grounding_warning_costs_more_than_a_structure_warning():
+    priorities = _priorities_for(C3_JD, _C3_CHOSEN)
+    common = dict(letter=_C3_WELL_PRIORITIZED, words=200, priorities=priorities,
+                  themes_covered=2, evidence_sources=2, named_terms_covered=2,
+                  company="C3 AI", job_title="Forward Deployed Engineer")
+    clean = grounding.cover_letter_score(problems=[], **common)
+    structural = grounding.cover_letter_score(
+        problems=[grounding.Problem("structure", "warning", "three paragraphs")], **common)
+    factual = grounding.cover_letter_score(
+        problems=[grounding.Problem("source_scope", "warning", "mixed sources")], **common)
+    assert clean > structural > factual, (clean, structural, factual)
+
+
+def test_g_the_letter_score_reaches_the_report_unchanged():
+    """The role-distinctive rubric survives the audit layer intact."""
+    priorities = _priorities_for(C3_JD, _C3_CHOSEN)
+    score = grounding.cover_letter_score(
+        letter=_C3_WELL_PRIORITIZED, problems=[], words=200, priorities=priorities,
+        themes_covered=2, evidence_sources=2, named_terms_covered=2,
+        company="C3 AI", job_title="Forward Deployed Engineer")
+    report = grounding.audit_report(letter_score=score)
+    assert list(report) == list(grounding.ASSESSMENT_FIELDS)
+    assert report["Cover Letter Score"] == f"{score:.1f} / 10"
+    # Only the deterministic field is populated; the rest await their audits.
+    assert report["Company STEM OPT Support"] == "UNKNOWN"
+    assert report["Company Visa Sponsorship"] == "UNKNOWN"
+    assert report["Callback Likelihood"] == "UNKNOWN"
+
+
+def test_g_no_immigration_language_is_injected_by_the_priority_block():
+    """Priorities steer evidence only; visa/OPT wording is never added."""
+    for jd_path, chosen in ((C3_JD, _C3_CHOSEN), (EPIC_JD, ["pintos", "lms", "fraud"]),
+                            (REDWOOD_JD, _SUPERHUMAN_CHOSEN),
+                            (BAE_JD, ["lms", "pintos", "tailor_pipeline"])):
+        block = grounding.render_letter_priorities(_priorities_for(jd_path, chosen)).lower()
+        for term in ("visa", "sponsor", "opt", "ead", "e-verify", "immigration"):
+            # Whole words only: "optimization" is not an OPT reference.
+            assert not re.search(r"(?<![a-z])" + term + r"(?![a-z])", block), \
+                (jd_path.name, term)
+
+
+# ================================================== AE. post-run Groq audit
+#
+# Three Groq calls run after the resume and cover letter are final. They are
+# advisory: nothing they return may re-enter generation, none of them may fall
+# back to Gemini, and only the company-research call may browse.
+
+AUDIT_PURPOSES = ("assessment", "company_research")
+
+
+class _RecordingTransport:
+    """Records every Request and answers from a per-purpose payload map."""
+
+    name = "recording"
+
+    def __init__(self, payloads: dict[str, object], *, fail: tuple[str, ...] = ()):
+        self.payloads = payloads
+        self.fail = fail
+        self.requests: list = []
+
+    def generate(self, request):
+        import llm_client
+
+        self.requests.append(request)
+        if request.purpose in self.fail:
+            raise llm_client.ProviderError("server_error", f"{request.purpose} is down")
+        payload = self.payloads.get(request.purpose, {})
+        text = payload if isinstance(payload, str) else json.dumps(payload)
+        return llm_client.Reply(text, self.name)
+
+
+def _audit_client(run, payloads, *, fail=()):
+    import logging
+
+    import llm_client
+
+    transport = _RecordingTransport(payloads, fail=fail)
+    client = llm_client.LLMClient(transport, transport, run["master"], run["policy"],
+                                  logging.getLogger("test"), audit=transport)
+    return transport, client
+
+
+def _experience_audit_payload(score: float = 8.5, **overrides) -> dict:
+    payload = {
+        "experience_selection_score": score,
+        "components": {"signal_interpretation": score, "policy_choice": score,
+                       "evidence_relevance": score},
+        "verdict": "PASS" if score >= 7.0 else "REVIEW",
+        "missed_signals": [],
+        "better_permitted_choice_exists": False,
+        "explanation": "the applied rule was the right one",
+    }
+    payload.update(overrides)
+    return payload
+
+
+# ---- transports: audits are Groq or UNKNOWN -------------------------------
+
+def test_the_audit_transport_has_no_gemini_fallback():
+    """build_client gives audits their own Groq transport with fallback=None."""
+    import llm_client
+
+    import logging
+    credentials = engine.Credentials(gemini_accounts=(1,), has_groq=True,
+                                    _gemini_keys={1: "k1"}, _groq_key="k2")
+    client = llm_client.build_client(engine.load_master(), engine.load_policy(),
+                                     logging.getLogger("test"), mock=False,
+                                     credentials=credentials)
+    # Two distinct Groq models, neither able to reach Gemini.
+    assert client.audit is not client.research
+    assert client.audit.fallback is None, "an audit may never fail over to Gemini"
+    assert client.research.fallback is None, "research may never fail over to Gemini"
+    assert client.audit.model == "qwen/qwen3.8-27b"
+    assert client.research.model == "openai/gpt-oss-20b"
+    # Generation is Gemini now, so there is no Groq generation transport left.
+    assert isinstance(client.gemini, llm_client.GeminiTransport)
+
+
+def test_every_audit_call_uses_the_audit_transport():
+    """Source contract: the three audit purposes invoke self.audit, not self.groq."""
+    source = Path(_llm_client().__file__).read_text(encoding="utf-8")
+    expected = {"assessment": "self.audit", "company_research": "self.research"}
+    for purpose, transport in expected.items():
+        head = source.split(f'"{purpose}", ')[0]
+        invoke = head.rsplit("self._invoke(", 1)[1].split(",")[0].strip()
+        assert invoke == transport, f"{purpose} must be invoked on {transport}"
+    # Generation is Gemini-only: the cover letter included. Selection goes
+    # through _call (which wraps _invoke), so both spellings are accepted.
+    for purpose in ("project_selection", "project_bullets", "cover_letter"):
+        head = source.split(f'"{purpose}", ')[0]
+        cut = max(head.rfind("self._invoke("), head.rfind("self._call("))
+        invoke = head[cut:].split("(", 1)[1].split(",")[0].strip()
+        assert invoke == "self.gemini", f"{purpose} must go to Gemini, got {invoke}"
+
+
+def _llm_client():
+    import llm_client
+
+    return llm_client
+
+
+def test_an_unavailable_groq_audit_transport_raises_instead_of_using_gemini():
+    import logging
+
+    import llm_client
+
+    credentials = engine.Credentials(gemini_accounts=(1,), has_groq=False,
+                                    _gemini_keys={1: "k1"})
+    audit = llm_client.GroqTransport(credentials, logging.getLogger("test"), fallback=None)
+    with pytest.raises(llm_client.ProviderError) as raised:
+        audit.generate(llm_client.Request("assessment", "prompt"))
+    assert raised.value.category == "auth_permission"
+
+
+# ---- only company research may browse -------------------------------------
+def test_browser_search_is_forced_and_only_for_web_search_requests():
+    """tool_choice="required" stops the model answering from stale memory."""
+    source = Path(_llm_client().__file__).read_text(encoding="utf-8")
+    generate = source.split("def _generate(self, request: Request) -> str:")[1]
+    generate = generate.split("# ================")[0]
+    block = generate.split("if request.web_search and not self.no_web_search:")[1]
+    block = block.split("try:")[0]
+    assert '"tools"' in block and "browser_search" in block
+    assert 'settings["tool_choice"] = "required"' in block
+    # Nothing outside that guard may set either field.
+    assert generate.count('settings["tool_choice"]') == 1
+    assert generate.count('settings["tools"]') == 1
+
+
+def test_no_generation_request_ever_asks_for_web_search():
+    source = Path(_llm_client().__file__).read_text(encoding="utf-8")
+    for purpose in ("project_selection", "project_bullets", "bullet_repair", "cover_letter"):
+        head = source.split(f'"{purpose}", ')[1].split("))")[0]
+        assert "web_search" not in head, f"{purpose} must never browse"
+
+
+def test_unsupported_browser_search_degrades_research_to_unknown():
+    """A rejected tool retries once without browsing, then reports UNKNOWN."""
+    import logging
+
+    import llm_client
+
+    calls: list[bool] = []
+
+    class _Rejecting(llm_client.GroqTransport):
+        def _generate(self, request):
+            calls.append(request.web_search and not self.no_web_search)
+            if request.web_search and not self.no_web_search:
+                raise llm_client.ProviderError("bad_request", "tools are not supported")
+            return json.dumps({"company_visa_sponsorship": "UNKNOWN",
+                               "company_stem_opt_support": "UNKNOWN",
+                               "job_posted": "UNKNOWN", "checked_at": "2026-09-15",
+                               "sources": []})
+
+    credentials = engine.Credentials(has_groq=True, _groq_key="k")
+    transport = _Rejecting(credentials, logging.getLogger("test"), model="m", fallback=None)
+    reply = transport.generate(llm_client.Request("company_research", "p", web_search=True))
+    assert calls == [True, False], calls
+    assert transport.no_web_search is True
+    research, _ = grounding.validate_company_research(json.loads(reply.text))
+    assert research["company_visa_sponsorship"] == "UNKNOWN"
+    assert research["job_posted"] == "UNKNOWN"
+
+
+# ---- audit results never re-enter generation ------------------------------
+
+def c3_signals(c3):
+    return engine.classify_jd(c3["jd"].text, c3["master"].section_order)
+
+def test_audit_results_are_never_read_back_into_generation():
+    """Source contract: no generation path reads an audit value."""
+    source = Path(run_pipeline.__file__).read_text(encoding="utf-8")
+    # Everything before the audit layer runs is generation. It cannot mention
+    # the audit names, because they do not exist yet.
+    run_one = source.split("def run_one(")[1]
+    generation = run_one.split("audits = run_audits(")[0]
+    for name in ("experience_selection_score", "better_permitted_choice_exists",
+                 "project_selection_score", "project_bullet_score",
+                 "callback_likelihood", "company_visa_sponsorship"):
+        assert name not in generation, f"{name} reached generation"
+    # And after the audits, only reporting happens: no regeneration entry point.
+    after = run_one.split("audits = run_audits(")[1].split("def assemble(")[0]
+    for forbidden in ("client.select_projects", "client.write_bullets",
+                      "client.cover_letter", "engine.select_experience",
+                      "fit_to_page(", "pdf.compile_pdf"):
+        assert forbidden not in after, f"{forbidden} runs after the audit layer"
+
+
+def test_a_low_application_audit_score_does_not_regenerate_anything(run, c3):
+    """2.0s across the board still produce a report, never a rewrite."""
+    signals = c3_signals(c3)
+    requirements = c3["requirements"]
+    ids = [r.requirement_id for r in engine.scored_requirements(requirements)]
+    payload = {
+        "fit_score": 2.0, "recommendation": "skip",
+        "summary": "Few requirements are evidenced.",
+        "eligibility": {"status": "uncertain", "details": []},
+        "strong_matches": [], "partial_matches": [],
+        "gaps": [{"requirement_id": ids[0], "importance": "required",
+                  "status": "unsupported", "detail": "no evidence", "evidence": None}],
+        "manual_review": [], "complementary_strengths": [],
+        "tailoring_quality": {"score": 2.0, "notes": ["weak"]},
+        "project_selection": {"score": 1.5, "components": {
+            "jd_relevance": 1.0, "best_available_chosen": 2.0,
+            "complementary_coverage": 1.0, "ranking_and_allocation": 2.0},
+            "notes": ["fraud overlapped more than lms"]},
+        "project_bullets": {"score": 2.5, "components": {
+            "jd_relevance": 2.0, "technical_specificity": 3.0, "evidence_fidelity": 2.0,
+            "impact_ownership": 3.0, "non_redundancy": 3.0}, "notes": ["thin"]},
+        "experience_selection": {"score": 3.0, "notes": ["the rule misreads the posting"]},
+        "callback_likelihood": "LOW", "risk_flags": [],
+    }
+    audit, problems = grounding.validate_application_audit(payload)
+    assert audit["project_selection_score"] == 1.5
+    assert audit["project_bullet_score"] == 2.5
+    assert audit["callback_likelihood"] == "LOW"
+    assert audit["experience_selection_score"] == 3.0
+    assert problems == []
+    # The report renders the low scores and stops there.
+    report = grounding.audit_report(application_audit={**audit, "fit_score": 2.0},
+                                    letter_score=9.5)
+    assert report["Project Selection Score"] == "1.5 / 10"
+    assert report["Callback Likelihood"] == "LOW"
+
+
+# ---- the audits see the COMPLETE option space -----------------------------
+def test_the_project_audit_sees_every_candidate_project(run, c3):
+    import llm_client
+
+    master = run["master"]
+    selection = llm_client.Selection(selected=["lms", "pintos", "temp"],
+                                     ranks={"lms": 1, "pintos": 2, "temp": 3},
+                                     reasons={"lms": "r1", "pintos": "r2", "temp": "r3"},
+                                     considered=[])
+    chosen = [master.project(p) for p in selection.selected]
+    bullets = {"lms": ["b1"], "pintos": ["b2"], "temp": ["b3"]}
+    catalogue = run_pipeline.project_catalogue(master, selection, chosen, bullets)
+
+    assert {e["project_id"] for e in catalogue} == {p.project_id for p in master.projects}
+    assert len(catalogue) > len(selection.selected), "the audit needs the whole catalogue"
+    assert sum(1 for e in catalogue if e["selected"]) == 3
+    # Passed-over projects arrive with the evidence needed to second-guess.
+    for entry in catalogue:
+        if not entry["selected"]:
+            assert entry["evidence"], entry["project_id"]
+            assert entry["tech"], entry["project_id"]
+
+
+def test_the_bullet_audit_sees_each_project_own_evidence(run, c3):
+    import llm_client
+
+    master = run["master"]
+    selection = llm_client.Selection(selected=["lms", "pintos", "temp"], ranks={},
+                                     reasons={}, considered=[])
+    chosen = [master.project(p) for p in selection.selected]
+    bullets = {"lms": ["Implemented the real-time subsystem with Django Channels."],
+               "pintos": ["Engineered the user-programs layer of Pintos in C."],
+               "temp": ["Built an IoT monitoring backend in Django REST Framework."]}
+    catalogue = run_pipeline.project_catalogue(master, selection, chosen, bullets)
+    by_id = {e["project_id"]: e for e in catalogue}
+    for pid, written in bullets.items():
+        assert by_id[pid]["final_bullets"] == written
+        assert by_id[pid]["evidence"] == " | ".join(master.project(pid).evidence)
+    # Pintos evidence must not leak into the LMS entry, or fidelity checks lie.
+    assert "Pintos" not in by_id["lms"]["evidence"]
+
+
+# ---- failure isolation ----------------------------------------------------
+def _selection(ids):
+    import llm_client
+
+    return llm_client.Selection(selected=list(ids), ranks={p: i + 1 for i, p in enumerate(ids)},
+                                reasons={p: "reason" for p in ids}, considered=[])
+
+
+def test_a_failed_audit_leaves_a_successful_run_successful():
+    """Status is decided by verification and the letter, never by an audit."""
+    source = Path(run_pipeline.__file__).read_text(encoding="utf-8")
+    block = source.split("audits = run_audits(")[1].split('status = "success"')[0]
+    # The audit errors are logged as warnings and never appended to `issues`.
+    assert 'audits["errors"]' in block
+    assert 'issues.append(f"audit' not in block
+    assert 'issues += [f"audit' not in block
+    assert 'status = "success" if not issues else "needs_review"' in source, \
+        "status must still be computed from issues alone"
+
+
+# ---- company research rules -----------------------------------------------
+
+def test_everify_alone_can_never_produce_stem_opt_yes():
+    data = {
+        "company_visa_sponsorship": "YES", "company_visa_confidence": "HIGH",
+        "company_stem_opt_support": "YES", "company_stem_opt_confidence": "HIGH",
+        "job_posted": "2026-09-01", "job_posted_confidence": "HIGH",
+        "checked_at": "2026-09-15",
+        "sources": [{"title": "Careers FAQ", "url": "https://example.com/faq",
+                     "scope": "company_policy",
+                     "evidence": "The company is an E-Verify participating employer."}],
+    }
+    research, _ = grounding.validate_company_research(data, jd_text="We are hiring.")
+    assert research["company_stem_opt_support"] == "UNKNOWN"
+    assert research["company_stem_opt_confidence"] == "LOW"
+    assert any("E-Verify" in note for note in research["deterministic_overrides"])
+    # Real STEM OPT evidence is still allowed through.
+    data["sources"].append({"title": "Immigration policy", "url": "https://example.com/i",
+                            "scope": "company_policy",
+                            "evidence": "We support the STEM OPT 24-month extension and "
+                                        "sign the I-983 training plan."})
+    data["company_stem_opt_support"] = "YES"
+    research, _ = grounding.validate_company_research(data, jd_text="We are hiring.")
+    assert research["company_stem_opt_support"] == "YES"
+
+
+def test_historical_h1b_alone_lowers_sponsorship_confidence():
+    data = {
+        "company_visa_sponsorship": "YES", "company_visa_confidence": "HIGH",
+        "company_stem_opt_support": "UNKNOWN", "company_stem_opt_confidence": "LOW",
+        "job_posted": "UNKNOWN", "job_posted_confidence": "LOW",
+        "checked_at": "2026-09-15",
+        "sources": [{"title": "H-1B disclosure data", "url": "https://example.gov/lca",
+                     "scope": "company_policy",
+                     "evidence": "14 H-1B LCA filings were certified in 2024."}],
+    }
+    research, _ = grounding.validate_company_research(data, jd_text="We are hiring.")
+    assert research["company_visa_sponsorship"] == "YES"
+    assert research["company_visa_confidence"] == "MEDIUM"
+    assert any("H-1B" in note for note in research["deterministic_overrides"])
+
+
+def test_a_job_level_no_sponsorship_restriction_overrides_company_evidence():
+    data = {
+        "company_visa_sponsorship": "YES", "company_visa_confidence": "HIGH",
+        "company_stem_opt_support": "YES", "company_stem_opt_confidence": "HIGH",
+        "job_posted": "2026-09-01", "job_posted_confidence": "HIGH",
+        "checked_at": "2026-09-15",
+        "sources": [{"title": "Careers", "url": "https://example.com",
+                     "scope": "company_policy",
+                     "evidence": "We sponsor visas for engineering roles."}],
+    }
+    jd_text = ("Software Engineer\n\nWe do not offer visa sponsorship for this position.\n")
+    assert grounding._explicit(jd_text, grounding._SPONSOR_YES,
+                               grounding._SPONSOR_NO) == "NO"
+    research, _ = grounding.validate_company_research(data, jd_text=jd_text)
+    assert research["company_visa_sponsorship"] == "NO"
+    assert research["company_visa_confidence"] == "HIGH"
+    assert research["company_stem_opt_support"] == "UNKNOWN"
+    assert any("overrides" in note for note in research["deterministic_overrides"])
+
+
+def test_research_never_substitutes_today_for_the_posting_date():
+    today = engine.date.today().isoformat()
+    research, _ = grounding.validate_company_research(
+        {"job_posted": "", "checked_at": today, "sources": []}, jd_text="We are hiring.")
+    assert research["job_posted"] == "UNKNOWN"
+    # A trustworthy date in the posting itself outranks a researched one.
+    research, _ = grounding.validate_company_research(
+        {"job_posted": "2020-01-01", "checked_at": today, "sources": []},
+        jd_text="We are hiring.", jd_posted="2026-09-01")
+    assert research["job_posted"] == "2026-09-01"
+    assert research["job_posted_confidence"] == "HIGH"
+
+
+# ---- the report's field contract ------------------------------------------
+
+def test_callback_likelihood_appears_exactly_once_and_the_old_fields_are_gone():
+    report = grounding.audit_report(
+        application_audit={"callback_likelihood": "HIGH", "fit_score": 8.0},
+        letter_score=9.5)
+    rendered = grounding.render_assessment_txt(report)
+    assert rendered.count("Callback Likelihood") == 1
+    assert "Can Expect Callback" not in rendered
+    assert "Callback Confidence" not in rendered
+    assert "Resume Score:" not in rendered
+    assert list(report) == list(grounding.ASSESSMENT_FIELDS)
+    assert len(grounding.ASSESSMENT_FIELDS) == 10
+    for retired in grounding.RETIRED_ASSESSMENT_FIELDS:
+        assert retired not in grounding.ASSESSMENT_FIELDS
+
+
+def test_the_retired_callback_fields_are_gone_from_the_whole_pipeline():
+    for module in (grounding, run_pipeline, _llm_client()):
+        source = Path(module.__file__).read_text(encoding="utf-8")
+        body = source.replace("RETIRED_ASSESSMENT_FIELDS", "")
+        # The only surviving mention is the retired-names tuple itself.
+        for retired in ("Can Expect Callback", "Callback Confidence"):
+            occurrences = body.count(retired)
+            allowed = 1 if module is grounding else 0
+            assert occurrences <= allowed, f"{retired} still in {module.__name__}"
+
+
+def test_the_terminal_block_matches_the_agreed_shape():
+    report = grounding.audit_report(
+        application_audit={"experience_selection_score": 8.7,
+                           "resume_tailoring_score": 9.5, "project_selection_score": 8.5,
+                           "project_bullet_score": 8.5, "callback_likelihood": "MEDIUM",
+                           "fit_score": 6.7},
+        research={"company_visa_sponsorship": "UNKNOWN",
+                  "company_stem_opt_support": "UNKNOWN", "job_posted": "UNKNOWN"},
+        letter_score=9.5)
+    lines = grounding.render_assessment_terminal(report, company="C3 AI",
+                                                 job_title="Forward Deployed Engineer")
+    assert lines[0] == "[ASSESSMENT] C3 AI | Forward Deployed Engineer"
+    assert lines[1] == "  Resume Tailoring Score: 9.5 / 10"
+    assert lines[-1] == "  Job Posted: UNKNOWN"
+    assert len(lines) == 11
+    for line in lines[1:]:
+        assert line.startswith("  "), line
+
+
+def test_batch_prints_the_assessment_before_the_next_job():
+    """run_one prints its own block, so it lands before the next [BATCH] line."""
+    source = Path(run_pipeline.__file__).read_text(encoding="utf-8")
+    assert "print_assessment(compact, company=" in source
+    batch = source.split("def run_batch(")[1]
+    assert '[BATCH] processing' in batch
+    # The batch loop itself must not print an assessment, or it would appear twice.
+    assert "print_assessment" not in batch.split("[BATCH] complete")[0]
+    assert "[BATCH] complete" in batch, "the final batch summary must stay"
+
+
+# ---- standalone --assess --------------------------------------------------
+
+def _c3_smoke_folder() -> Path:
+    folders = sorted((ROOT / "output" / "_smoke_tests").glob("C3_AI_*"))
+    if not folders:
+        pytest.skip("no C3 smoke folder; run the C3 mock first")
+    return folders[-1]
+
+
+def test_assess_makes_two_groq_calls_and_zero_gemini_calls():
+    run_dir = _c3_smoke_folder()
+    result = run_pipeline.assess_run(run_dir, mock=True, console=False)
+    assert result.status == "success", result.issues
+    calls = (result.strategy.get("audit") or {}).get("provider_calls") or []
+    purposes = [c["purpose"] for c in calls]
+    assert sorted(purposes) == sorted(AUDIT_PURPOSES), purposes
+    assert len(calls) == 2
+    assert all(c["provider"] != "gemini" for c in calls), calls
+
+
+def test_assess_preserves_every_generation_artifact():
+    import hashlib
+
+    run_dir = _c3_smoke_folder()
+    watched = ["resume.tex", "resume.txt", "cover_letter.txt", "job_description.txt"]
+    watched += [p.name for p in run_dir.glob("*.pdf")]
+    before = {name: hashlib.sha256((run_dir / name).read_bytes()).hexdigest()
+              for name in watched if (run_dir / name).exists()}
+    assert len(before) == 5, sorted(before)
+
+    result = run_pipeline.assess_run(run_dir, mock=True, console=False)
+    assert result.status == "success", result.issues
+    after = {name: hashlib.sha256((run_dir / name).read_bytes()).hexdigest()
+             for name in before}
+    assert after == before
+
+
+def test_assess_regenerates_assessment_txt_and_only_the_audit_block():
+    run_dir = _c3_smoke_folder()
+    strategy_before = json.loads((run_dir / "strategy.json").read_text(encoding="utf-8"))
+    (run_dir / "assessment.txt").write_text("stale\n", encoding="utf-8")
+
+    result = run_pipeline.assess_run(run_dir, mock=True, console=False)
+    assert result.status == "success", result.issues
+    rendered = (run_dir / "assessment.txt").read_text(encoding="utf-8")
+    assert "stale" not in rendered
+    assert rendered.splitlines()[0].startswith("Resume Tailoring Score:")
+    assert len(rendered.strip().splitlines()) == 10
+
+    strategy_after = json.loads((run_dir / "strategy.json").read_text(encoding="utf-8"))
+    changed = {key for key in set(strategy_before) | set(strategy_after)
+               if strategy_before.get(key) != strategy_after.get(key)}
+    # Only the audit block may move. It can also be byte-identical when a
+    # previous --assess in this session produced the same values.
+    assert changed <= {"audit"}, changed
+    assert strategy_after["audit"]["mode"] == "standalone --assess"
+    assert strategy_after["audit"]["report"] == result.assessment
+    assert set(strategy_after) >= set(strategy_before)
+
+
+def test_assess_never_compiles_or_regenerates(tmp_path):
+    source = Path(run_pipeline.__file__).read_text(encoding="utf-8")
+    block = source.split("def assess_run(")[1].split("def revalidate(")[0]
+    for forbidden in ("compile_pdf", "fit_to_page", "select_projects", "write_bullets",
+                      "cover_letter(", "finalize_artifacts", "assemble("):
+        assert forbidden not in block, f"--assess must not call {forbidden}"
+    # Only two writes are permitted, plus its own log.
+    writes = re.findall(r'\(run_dir / "([^"]+)"\)\.write_text', block)
+    writes += re.findall(r'(\w+)_path\.write_text', block)
+    assert set(writes) <= {"assessment.txt", "strategy"}, writes
+
+
+def test_assess_never_touches_production_tracking():
+    import hashlib
+
+    source = Path(run_pipeline.__file__).read_text(encoding="utf-8")
+    block = source.split("def assess_run(")[1].split("def revalidate(")[0]
+    for forbidden in ("Tracker(", "PROCESSED_CSV", "PROCESSED_INDEX", "tracker.record"):
+        assert forbidden not in block, f"--assess must not reference {forbidden}"
+
+    tracking = [ROOT / "processed_jobs.csv", ROOT / ".processed_index.json"]
+    before = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+              for p in tracking if p.exists()}
+    run_pipeline.assess_run(_c3_smoke_folder(), mock=True, console=False)
+    after = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+             for p in tracking if p.exists()}
+    assert after == before, "--assess changed production tracking"
+
+
+def test_assess_reconstructs_experience_without_reselecting_it():
+    """The ids come from strategy.json; no swap rule is re-evaluated."""
+    run_dir = _c3_smoke_folder()
+    strategy = json.loads((run_dir / "strategy.json").read_text(encoding="utf-8"))
+    policy = engine.load_policy()
+    decision = run_pipeline._decision_from_strategy(strategy, policy)
+    assert decision.shipped_ids == strategy["experience"]["shipped_ids"]
+    assert decision.rule == strategy["experience"]["rule"]
+    # Wording comes from the approved library by id, never from the model.
+    by_id = {e.bullet_id: e for e in policy.experience_library}
+    by_id.update({e.bullet_id: e for e in policy.alternate_library})
+    for bullet_id, _action, latex in decision.shipped:
+        if bullet_id in by_id:
+            assert latex == by_id[bullet_id].latex
+
+
+# ---- BullsAI stays dormant -------------------------------------------------
+
+def test_no_bullsai_behaviour_is_added_by_the_audit_layer():
+    """resume_engine.py is frozen, so its dormant field stays; nothing new."""
+    for module in (grounding, run_pipeline, _llm_client()):
+        source = Path(module.__file__).read_text(encoding="utf-8").lower()
+        assert "bullsai" not in source, module.__name__
+    # The dormant credential field is never wired to a transport.
+    engine_source = Path(engine.__file__).read_text(encoding="utf-8")
+    assert "BullsAITransport" not in engine_source
+    assert "has_bullsai" in engine_source, "unchanged frozen file"
+
+
+# ============================================ AF. GROQ_MODEL config loading
+#
+# resume_engine.GROQ_MODEL is bound at import time from os.environ only, while
+# load_credentials() separately merges .env. A project whose model lives in
+# .env alone therefore had a working key and an empty model, and Groq called
+# itself unavailable. The model is resolved at call time instead.
+
+def _credentials(groq: bool = True):
+    return engine.Credentials(gemini_accounts=(1,), has_groq=groq,
+                              _gemini_keys={1: "k1"},
+                              _groq_key="k2" if groq else None)
+
+
+def _build(monkeypatch, tmp_path, *, environ=None, dotenv=None):
+    """build_client with a controlled process env and .env file."""
+    import logging
+
+    import llm_client
+
+    monkeypatch.delenv("GROQ_MODEL", raising=False)
+    if environ is not None:
+        monkeypatch.setenv("GROQ_MODEL", environ)
+    lines = [f"{key}={value}" for key, value in (dotenv or {}).items()]
+    (tmp_path / ".env").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    monkeypatch.setattr(engine, "PROJECT_ROOT", tmp_path)
+    return llm_client.build_client(engine.load_master(), engine.load_policy(),
+                                    logging.getLogger("test"), mock=False,
+                                    credentials=_credentials())
+
+
+def test_groq_model_comes_from_dotenv_when_the_environment_lacks_it(monkeypatch, tmp_path):
+    """The reported bug: key found in .env, model constant left empty."""
+    import llm_client
+
+    monkeypatch.delenv("GROQ_MODEL", raising=False)
+    (tmp_path / ".env").write_text(
+        'GROQ_API_KEY=secret\nGROQ_MODEL=openai/gpt-oss-120b\n', encoding="utf-8")
+    monkeypatch.setattr(engine, "PROJECT_ROOT", tmp_path)
+    assert llm_client.configured_groq_model() == "openai/gpt-oss-120b"
+    # The stale import-time constant is exactly what this works around.
+    assert os.getenv("GROQ_MODEL") is None
+
+
+def test_the_process_environment_overrides_dotenv(monkeypatch, tmp_path):
+    import llm_client
+
+    monkeypatch.setenv("GROQ_MODEL", "env/wins")
+    (tmp_path / ".env").write_text("GROQ_MODEL=dotenv/loses\n", encoding="utf-8")
+    monkeypatch.setattr(engine, "PROJECT_ROOT", tmp_path)
+    assert llm_client.configured_groq_model() == "env/wins"
+
+
+def test_surrounding_whitespace_is_stripped(monkeypatch, tmp_path):
+    import llm_client
+
+    monkeypatch.setenv("GROQ_MODEL", "  openai/gpt-oss-120b  ")
+    monkeypatch.setattr(engine, "PROJECT_ROOT", tmp_path)
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    assert llm_client.configured_groq_model() == "openai/gpt-oss-120b"
+
+
+def test_no_hardcoded_model_is_ever_restored(monkeypatch, tmp_path):
+    """Neither source configured: empty, and Groq says exactly that."""
+    import llm_client
+
+    for name in ("GROQ_MODEL", "GROQ_ASSESSMENT_MODEL", "GROQ_RESEARCH_MODEL"):
+        monkeypatch.delenv(name, raising=False)
+    (tmp_path / ".env").write_text("GROQ_API_KEY=secret\n", encoding="utf-8")
+    monkeypatch.setattr(engine, "PROJECT_ROOT", tmp_path)
+    assert llm_client.assessment_model() == ""
+    assert llm_client.research_model() == ""
+
+    client = _build(monkeypatch, tmp_path, dotenv={"GROQ_API_KEY": "secret"})
+    assert client.audit.model == "" and client.research.model == ""
+    assert client.audit.available is False and client.research.available is False
+    with pytest.raises(llm_client.ProviderError) as raised:
+        client.audit.generate(llm_client.Request("assessment", "p"))
+    assert "no Groq model is configured" in str(raised.value)
+    # No model name may act as a DEFAULT. A model may be named in a
+    # per-model calibration or rate table - that is tuning, not a fallback -
+    # but never as the value either resolver falls back to.
+    source = Path(llm_client.__file__).read_text(encoding="utf-8")
+    assert "gpt-oss-120b" not in source, "the retired model must be gone entirely"
+    for resolver in ("def assessment_model()", "def research_model()"):
+        body = source.split(resolver)[1].split("\n\n\n")[0]
+        for named in ("qwen", "gpt-oss"):
+            assert named not in body.lower(), f"{resolver} must have no default"
+    # And the calibration tables never supply a model to call.
+    for table in ("_MODEL_INPUT_CHARS_PER_TOKEN", "_MODEL_INPUT_SAFETY"):
+        assert f"{table}: dict" in source or f"{table} = " in source, table
+    assert llm_client.assessment_model() == ""
+    assert llm_client.research_model() == ""
+
+
+def test_each_audit_transport_gets_its_own_configured_model(monkeypatch, tmp_path):
+    client = _build(monkeypatch, tmp_path,
+                    dotenv={"GROQ_ASSESSMENT_MODEL": "qwen/qwen3.8-27b",
+                            "GROQ_RESEARCH_MODEL": "openai/gpt-oss-20b"})
+    assert client.audit.model == "qwen/qwen3.8-27b"
+    assert client.research.model == "openai/gpt-oss-20b"
+    assert client.audit.available and client.research.available
+    # GPT-OSS-120B has no normal role any more.
+    assert "120b" not in f"{client.audit.model}{client.research.model}"
+
+
+def test_model_settings_follow_the_same_env_then_dotenv_precedence(monkeypatch, tmp_path):
+    import llm_client
+
+    monkeypatch.setattr(engine, "PROJECT_ROOT", tmp_path)
+    (tmp_path / ".env").write_text(
+        "GROQ_ASSESSMENT_MODEL=dotenv/assessor\nGROQ_RESEARCH_MODEL=dotenv/researcher\n",
+        encoding="utf-8")
+    monkeypatch.delenv("GROQ_ASSESSMENT_MODEL", raising=False)
+    monkeypatch.delenv("GROQ_RESEARCH_MODEL", raising=False)
+    assert llm_client.assessment_model() == "dotenv/assessor"
+    assert llm_client.research_model() == "dotenv/researcher"
+    monkeypatch.setenv("GROQ_ASSESSMENT_MODEL", "env/assessor")
+    assert llm_client.assessment_model() == "env/assessor"
+    assert llm_client.research_model() == "dotenv/researcher"
+
+
+def test_neither_audit_transport_can_reach_gemini(monkeypatch, tmp_path):
+    client = _build(monkeypatch, tmp_path,
+                    dotenv={"GROQ_ASSESSMENT_MODEL": "a", "GROQ_RESEARCH_MODEL": "b"})
+    assert client.audit.fallback is None
+    assert client.research.fallback is None
+    assert client.audit is not client.research
+    # And generation has no Groq transport at all to fall back FROM.
+    assert client.gemini is client.groq
+
+
+def test_each_model_has_its_own_pacing_budget(monkeypatch, tmp_path):
+    """Qwen's reservation must not stall GPT-OSS, or parallelism buys nothing."""
+    import llm_client
+
+    client = _build(monkeypatch, tmp_path,
+                    dotenv={"GROQ_ASSESSMENT_MODEL": "qwen/qwen3.8-27b",
+                            "GROQ_RESEARCH_MODEL": "openai/gpt-oss-20b"})
+    assert client.audit.budget is not client.research.budget
+    assert llm_client.budget_for("qwen/qwen3.8-27b") is client.audit.budget
+    assert llm_client.budget_for("openai/gpt-oss-20b") is client.research.budget
+
+    # Fill the assessor's window completely; research must still not wait.
+    client.audit.budget.record(client.audit.budget.limit * 2)
+    slept = []
+    client.research.budget._sleep = lambda s: slept.append(s)
+    assert client.research.budget.wait_for(1000) == 0.0
+    assert slept == [], "research paced on the assessor's budget"
+
+
+def test_per_model_tpm_limits_are_configurable(monkeypatch, tmp_path):
+    import llm_client
+
+    monkeypatch.setattr(engine, "PROJECT_ROOT", tmp_path)
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    monkeypatch.delenv("GROQ_TPM_LIMIT", raising=False)
+    monkeypatch.setenv("GROQ_TPM_LIMIT__QWEN_QWEN3_8_27B", "30000")
+    assert llm_client.model_tpm_limit("qwen/qwen3.8-27b") == 30000
+    # Unset models fall back to the global setting, then the default.
+    monkeypatch.setenv("GROQ_TPM_LIMIT", "12000")
+    assert llm_client.model_tpm_limit("openai/gpt-oss-20b") == 12000
+
+
+def test_mock_mode_is_untouched_by_model_resolution(monkeypatch, tmp_path):
+    """--mock never reads GROQ_MODEL: there is no transport to configure."""
+    import logging
+
+    import llm_client
+
+    monkeypatch.delenv("GROQ_MODEL", raising=False)
+    monkeypatch.setattr(engine, "PROJECT_ROOT", tmp_path)
+    client = llm_client.build_client(engine.load_master(), engine.load_policy(),
+                                      logging.getLogger("test"), mock=True)
+    assert isinstance(client.groq, llm_client.MockTransport)
+    assert client.audit is client.groq
+
+
+def test_model_resolution_touches_no_generation_behaviour():
+    """The resolvers are read only by build_client, never by a prompt path."""
+    source = Path(_llm_client().__file__).read_text(encoding="utf-8")
+    for resolver in ("assessment_model()", "research_model()"):
+        # One call site (build_client), plus its own definition.
+        assert source.count(resolver) - source.count(f"def {resolver}") == 1, resolver
+    builder = source.split("def build_client(")[1]
+    assert "assessment_model()" in builder and "research_model()" in builder
+    for method in ("def select_projects(", "def write_bullets(", "def cover_letter(",
+                   "def assess(", "def research_company("):
+        # Stop at the next method OR the next module-level definition, so a
+        # trailing method does not swallow build_client.
+        body = source.split(method)[1].split("\n    def ")[0].split("\n\ndef ")[0]
+        assert "configured_groq_model" not in body, method
+
+
+# ====================================== AG. Groq token budget / 413 handling
+#
+# A live --assess run failed three ways at once: the application audit asked
+# for more tokens than the whole per-minute budget and was retried three times
+# (each retry spending the budget again), and the research call was rejected
+# because Groq refuses JSON mode alongside tool calling.
+
+def _captured_audit_requests(run, c3):
+    """Every audit Request the client would send, without any network call."""
+    import logging
+
+    import llm_client
+
+    class _Capture:
+        name = "capture"
+
+        def __init__(self):
+            self.requests = []
+
+        def generate(self, request):
+            self.requests.append(request)
+            raise llm_client.ProviderError("transport", "captured")
+
+    transport = _Capture()
+    client = llm_client.LLMClient(transport, transport, run["master"], run["policy"],
+                                   logging.getLogger("test"), audit=transport)
+    signals = c3_signals(c3)
+    decision = engine.select_experience(run["template"], run["policy"], signals)
+    master = run["master"]
+    ids = ["lms", "pintos", "temp"]
+    chosen = [master.project(p) for p in ids]
+    bullets = {p: [f"A bullet about {p}."] for p in ids}
+    catalogue = run_pipeline.project_catalogue(master, _selection(ids), chosen, bullets)
+    for call in (
+        lambda: client.assess(
+            c3["jd"], signals, chosen, ["Python"],
+            experience_plain=["x"], project_bullets=bullets,
+            requirements=c3["requirements"], tailoring={}, extra_experience=[],
+            project_catalogue=catalogue,
+            selection_detail={"selected": ids, "display_order": ids,
+                              "allocation": {"lms": 3, "pintos": 2, "temp": 2}}),
+        lambda: client.research_company(c3["jd"], jd_posted="UNKNOWN", today="2026-09-15"),
+    ):
+        try:
+            call()
+        except Exception:                    # noqa: BLE001 - the capture raises
+            pass
+    return {r.purpose: r for r in transport.requests}
+
+
+# ---- 413 is never retried -------------------------------------------------
+
+@pytest.mark.parametrize("status, body", [
+    (413, "Request too large for model"),
+    (200, "Error code: 413 - Request too large for model on tokens per minute (TPM)"),
+])
+def test_a_request_too_large_is_its_own_category(status, body):
+    import llm_client
+
+    assert llm_client.classify_http(status, body) == "request_too_large"
+    assert llm_client.classify_exception(
+        Exception("Error code: 413 - {'message': 'Request too large ...'}")
+    ) == "request_too_large"
+
+
+def test_a_request_too_large_is_not_retried():
+    """Three attempts at an oversize request spend the budget three times."""
+    import logging
+
+    import llm_client
+
+    attempts = []
+
+    class _TooLarge(llm_client.GroqTransport):
+        def _generate(self, request):
+            attempts.append(request.purpose)
+            raise llm_client.ProviderError("request_too_large",
+                                           "Request too large for model")
+
+    transport = _TooLarge(_credentials(), logging.getLogger("test"), model="m",
+                          fallback=None, budget=llm_client.TokenBudget(100000))
+    with pytest.raises(llm_client.ProviderError) as raised:
+        transport.generate(llm_client.Request("assessment", "p" * 100))
+    assert len(attempts) == 1, f"retried {len(attempts)} times"
+    assert raised.value.category == "request_too_large"
+    # A retryable category still gets its attempts.
+    assert llm_client.GROQ_MAX_ATTEMPTS == 3
+
+
+# ---- JSON mode and tool calling are mutually exclusive on Groq ------------
+
+def test_company_research_asks_for_tools_instead_of_json_mode(run, c3):
+    """Groq: "json mode cannot be combined with tool/function calling"."""
+    requests = _captured_audit_requests(run, c3)
+    research = requests["company_research"]
+    assert research.web_search is True
+    assert research.json is False, "JSON mode would make Groq reject the browsing tool"
+    # The shape is still demanded, so parse_json has something to read.
+    assert "Return ONLY valid JSON" in research.prompt
+    # The other two audits keep JSON mode and never browse.
+    assert requests["assessment"].json is True
+    assert requests["assessment"].web_search is False
+
+
+def test_a_prose_mode_research_reply_still_parses():
+    import llm_client
+
+    fenced = ('```json\n{"company_visa_sponsorship": "NO", "company_visa_confidence": '
+              '"HIGH", "company_stem_opt_support": "UNKNOWN", "job_posted": "2026-09-01", '
+              '"checked_at": "2026-09-15", "sources": []}\n```')
+    data = llm_client.parse_json(fenced, "company_research")
+    research, _ = grounding.validate_company_research(data, jd_text="We are hiring.")
+    assert research["company_visa_sponsorship"] == "NO"
+    assert research["job_posted"] == "2026-09-01"
+
+
+# ---- every audit request fits the per-minute budget -----------------------
+
+def test_each_audit_request_fits_the_token_budget(run, c3):
+    import llm_client
+
+    requests = _captured_audit_requests(run, c3)
+    for purpose, request in requests.items():
+        estimate = llm_client.estimate_tokens(request)
+        assert estimate < llm_client.GROQ_TPM_LIMIT, (
+            f"{purpose} reserves ~{estimate} tokens, over the "
+            f"{llm_client.GROQ_TPM_LIMIT} TPM budget; a 413 cannot be retried away")
+
+
+def test_audits_reserve_only_the_output_they_need():
+    import llm_client
+
+    assert set(llm_client.AUDIT_OUTPUT_TOKENS) == set(AUDIT_PURPOSES)
+    for purpose, reserved in llm_client.AUDIT_OUTPUT_TOKENS.items():
+        assert reserved < engine.GROQ_MAX_OUTPUT_TOKENS, purpose
+    assert sum(llm_client.AUDIT_OUTPUT_TOKENS.values()) < llm_client.GROQ_TPM_LIMIT
+
+
+def test_the_catalogue_still_names_every_project_after_trimming(run, c3):
+    """Token trimming may abridge evidence; it may not hide a project."""
+    requests = _captured_audit_requests(run, c3)
+    prompt = requests["assessment"].prompt
+    for project in run["master"].projects:
+        assert project.project_id in prompt, project.project_id
+    # The three that shipped still carry their FULL evidence for fidelity.
+    for pid in ("lms", "pintos", "temp"):
+        evidence = run["master"].project(pid).evidence
+        assert evidence[0][:60] in prompt, pid
+    assert "FINAL BULLETS" in prompt
+
+def _budget(limit=8000):
+    import llm_client
+
+    state = {"now": 0.0, "slept": []}
+
+    def sleep(seconds):
+        state["slept"].append(seconds)
+        state["now"] += seconds
+
+    budget = llm_client.TokenBudget(limit, sleep=sleep, clock=lambda: state["now"])
+    return budget, state
+
+
+def test_the_budget_waits_for_the_window_to_clear():
+    budget, state = _budget(8000)
+    assert budget.wait_for(6000) == 0.0
+    budget.record(6000)
+    # 6000 + 3000 exceeds 8000, so the oldest usage must age out first.
+    waited = budget.wait_for(3000)
+    assert waited == pytest.approx(60.0)
+    assert state["slept"] == [pytest.approx(60.0)]
+    # The window is empty again, so the call proceeds.
+    assert sum(t for _, t in budget.used) == 0
+
+
+def test_the_budget_never_blocks_a_request_bigger_than_the_whole_limit():
+    budget, state = _budget(8000)
+    budget.record(100)
+    # Clamped to the limit, so it waits once for the window and then proceeds
+    # rather than looping forever on something that can never fit.
+    waited = budget.wait_for(50000)
+    assert waited <= 60.0
+    assert state["slept"] and sum(state["slept"]) <= 60.0
+
+
+def test_an_empty_window_never_waits():
+    budget, state = _budget(8000)
+    assert budget.wait_for(50000) == 0.0
+    assert state["slept"] == []
+
+
+def test_actual_usage_replaces_the_pre_call_estimate():
+    budget, _ = _budget(8000)
+    budget.record(5000)                       # the estimate
+    budget.record(1200, replaces=5000)        # what the provider billed
+    assert sum(t for _, t in budget.used) == 1200
+
+
+def test_the_transport_records_provider_usage_when_it_is_reported():
+    import logging
+
+    import llm_client
+
+    class _Reporting(llm_client.GroqTransport):
+        def _generate(self, request):
+            self.last_usage = 1500
+            return "{}"
+
+    budget, _ = _budget(100000)
+    transport = _Reporting(_credentials(), logging.getLogger("test"), model="m",
+                           fallback=None, budget=budget)
+    transport.generate(llm_client.Request("assessment", "p" * 6000, max_tokens=2600))
+    assert sum(t for _, t in budget.used) == 1500, budget.used
+
+
+def test_budgets_are_per_model_not_per_account(monkeypatch, tmp_path):
+    """The two audits are deliberately parallel, so they cannot share a bucket."""
+    import llm_client
+
+    client = _build(monkeypatch, tmp_path,
+                    dotenv={"GROQ_ASSESSMENT_MODEL": "model/one",
+                            "GROQ_RESEARCH_MODEL": "model/two"})
+    assert client.audit.budget is not client.research.budget
+    assert client.audit.budget is llm_client.budget_for("model/one")
+    assert client.research.budget is llm_client.budget_for("model/two")
+    assert llm_client.budget_for("model/one").limit == llm_client.model_tpm_limit("model/one")
+
+
+def test_the_budget_is_advisory_and_paces_only_groq():
+    """The mock transport has no budget: --mock never waits."""
+    import logging
+
+    import llm_client
+
+    mock = llm_client.MockTransport(engine.load_master(), logging.getLogger("test"))
+    assert not hasattr(mock, "budget")
+    source = Path(llm_client.__file__).read_text(encoding="utf-8")
+    # Pacing lives in the Groq transport only.
+    assert source.count("self.budget.wait_for(") == 1
+    # TokenBudget is defined between the two transports, so stop there.
+    gemini = source.split("class GeminiTransport")[1].split("class TokenBudget")[0]
+    assert "budget" not in gemini, "the Gemini transport is not paced by the Groq budget"
+
+
+# ================================ AH. reasoning effort and truncated output
+#
+# The second live --assess run truncated two audits: GPT-OSS at its default
+# medium reasoning effort spent the reserved output thinking, hit
+# finish_reason=length, and the identical retry then blew the TPM window. The
+# audits now ask for low effort, promise compact output, and never resend a
+# request that truncated.
+
+def _stub_groq(*, generate, budget=None, model="m"):
+    """A GroqTransport whose only live method is replaced."""
+    import logging
+
+    import llm_client
+
+    class _Stub(llm_client.GroqTransport):
+        def _generate(self, request):
+            return generate(self, request)
+
+    return _Stub(_credentials(), logging.getLogger("test"), model=model,
+                 fallback=None, budget=budget or llm_client.TokenBudget(1_000_000))
+
+
+# ---- 1. low reasoning on the audits only ----------------------------------
+
+def test_the_audits_keep_reasoning_out_of_their_output_budgets(run, c3):
+    requests = _captured_audit_requests(run, c3)
+    assert sorted(requests) == sorted(AUDIT_PURPOSES)
+    # The assessment turns reasoning OFF: hidden reasoning still spent the 900
+    # completion tokens and truncated the document before it closed.
+    assert requests["assessment"].reasoning_effort == "none"
+    assert requests["assessment"].reasoning_format is None
+    assert requests["assessment"].include_reasoning is None
+    # Research is unchanged: low effort, reasoning not returned.
+    assert requests["company_research"].reasoning_effort == "low"
+    assert requests["company_research"].include_reasoning is False
+    assert requests["company_research"].reasoning_format is None
+
+
+def test_generation_requests_carry_no_reasoning_settings(run, bae):
+    """Generation keeps the provider default: the fields are not sent at all."""
+    import llm_client
+
+    transport = _SequenceTransport([json.dumps({
+        "role_family": "backend", "career_stage": "early_career",
+        "selected": [{"project_id": pid, "llm_rank": rank, "reason": "r"}
+                     for rank, pid in enumerate(("lms", "pintos", "temp"), start=1)],
+        "considered": []})])
+    import logging
+    client = llm_client.LLMClient(transport, transport, run["master"], run["policy"],
+                                   logging.getLogger("test"), audit=transport)
+    client.select_projects(bae["jd"].text, c3_signals(bae), 3)
+    request = transport.requests[0]
+    assert request.purpose == "project_selection"
+    assert request.reasoning_effort is None
+    assert request.include_reasoning is None
+    # Defaults on the dataclass, so no generation path can leak them.
+    blank = llm_client.Request("project_bullets", "p")
+    assert blank.reasoning_effort is None and blank.include_reasoning is None
+
+
+def test_reasoning_settings_reach_the_sdk_only_when_asked():
+    import llm_client
+
+    captured = {}
+
+    def fake(self, request):
+        # Mirror what _generate assembles, without the SDK.
+        settings = {}
+        if request.json:
+            settings["response_format"] = {"type": "json_object"}
+        if request.reasoning_effort:
+            settings["reasoning_effort"] = request.reasoning_effort
+        if request.include_reasoning is not None:
+            settings["include_reasoning"] = request.include_reasoning
+        captured[request.purpose] = settings
+        return "{}"
+
+    source = Path(llm_client.__file__).read_text(encoding="utf-8")
+    generate = source.split("def _generate(self, request: Request) -> str:")[1]
+    generate = generate.split("\n\n\n")[0]
+    assert 'settings["reasoning_effort"] = request.reasoning_effort' in generate
+    assert 'settings["include_reasoning"] = request.include_reasoning' in generate
+    # Guarded, so an unset field is never transmitted.
+    assert "if request.reasoning_effort:" in generate
+    assert "if request.include_reasoning is not None:" in generate
+
+    transport = _stub_groq(generate=fake)
+    transport.generate(llm_client.Request("assessment", "p", **llm_client.AUDIT_REASONING))
+    transport.generate(llm_client.Request("project_bullets", "p"))
+    assert captured["assessment"]["reasoning_effort"] == "low"
+    assert captured["assessment"]["include_reasoning"] is False
+    assert "reasoning_effort" not in captured["project_bullets"]
+    assert "include_reasoning" not in captured["project_bullets"]
+
+
+# ---- 2. the output caps ---------------------------------------------------
+
+def test_the_output_caps_are_exactly_as_agreed():
+    import llm_client
+
+    assert llm_client.AUDIT_OUTPUT_TOKENS == {
+        # Qwen's tier caps OUTPUT tokens per minute at 1000, so the assessment
+        # reserves 900; research is unchanged.
+        "assessment": 900,
+        "company_research": 1000,
+    }
+
+
+def test_each_audit_request_still_fits_after_the_cap_change(run, c3):
+    import llm_client
+
+    requests = _captured_audit_requests(run, c3)
+    for purpose, request in requests.items():
+        assert request.max_tokens == llm_client.AUDIT_OUTPUT_TOKENS[purpose], purpose
+        assert llm_client.estimate_tokens(request) < llm_client.GROQ_TPM_LIMIT, purpose
+
+
+# ---- 3. compact output, same information ---------------------------------
+
+def test_the_audits_demand_compact_output_without_dropping_inputs(run, c3):
+    requests = _captured_audit_requests(run, c3)
+    assessment = requests["assessment"].prompt
+    assert "OUTPUT LENGTH" in assessment
+    for rule in ("2 entries each", "at most 35 words",
+                 "HARD 900-token completion budget"):
+        assert rule in assessment, rule
+    # The schema now enforces the shape, so its prose is gone from the prompt.
+    for redundant in ("Return ONLY valid JSON", "ENUM CONTRACT", '"fit_score": 8.2'):
+        assert redundant not in assessment, redundant
+    assert "HOW THE SHIPPED PROFESSIONAL EXPERIENCE WAS CHOSEN" in assessment
+    assert "at most 15 words" in assessment
+    # Inputs are untouched: every project and every approved bullet is still
+    # offered, with the selected projects' full evidence.
+    for project in run["master"].projects:
+        assert project.project_id in assessment, project.project_id
+    for pid in ("lms", "pintos", "temp"):
+        assert run["master"].project(pid).evidence[0][:60] in assessment, pid
+
+
+
+def test_the_audit_schemas_are_unchanged():
+    """Compact prose must not become a different contract."""
+    assert grounding.EXPERIENCE_AUDIT_COMPONENTS == (
+        "signal_interpretation", "policy_choice", "evidence_relevance")
+    assert grounding.PROJECT_SELECTION_COMPONENTS == (
+        "jd_relevance", "best_available_chosen", "complementary_coverage",
+        "ranking_and_allocation")
+    assert grounding.PROJECT_BULLET_COMPONENTS == (
+        "jd_relevance", "technical_specificity", "evidence_fidelity",
+        "impact_ownership", "non_redundancy")
+    assert grounding.AUDIT_VERDICTS == ("PASS", "REVIEW")
+    assert grounding.CALLBACK_LIKELIHOOD == ("LOW", "MEDIUM", "HIGH", "UNKNOWN")
+    audit, _ = grounding.validate_application_audit(
+        {"experience_selection": {"score": 8.0, "notes": ["fits"]},
+         "tailoring_quality": {"score": 9.0},
+         "project_selection": {"score": 8.0, "components": {}},
+         "project_bullets": {"score": 8.0, "components": {}},
+         "callback_likelihood": "MEDIUM"})
+    assert audit["experience_selection_score"] == 8.0
+    assert audit["callback_likelihood"] == "MEDIUM"
+
+
+# ---- 4. a truncated answer is never resent -------------------------------
+
+def test_finish_reason_length_becomes_output_truncated():
+    import llm_client
+
+    def truncate(self, request):
+        raise ProviderTruncation(request)
+
+    class ProviderTruncation(llm_client.ProviderError):
+        def __init__(self, request):
+            super().__init__("output_truncated",
+                             f"Groq hit the {request.max_tokens}-token output cap "
+                             f"(finish_reason=length)")
+
+    # The category is raised by _generate itself, at the finish_reason check.
+    source = Path(llm_client.__file__).read_text(encoding="utf-8")
+    block = source.split('if choice.finish_reason == "length":')[1].split("return")[0]
+    assert 'ProviderError("output_truncated"' in block
+    assert "malformed_response" not in block
+
+    transport = _stub_groq(generate=truncate)
+    with pytest.raises(llm_client.ProviderError) as raised:
+        transport.generate(llm_client.Request("assessment", "p"))
+    assert raised.value.category == "output_truncated"
+
+
+@pytest.mark.parametrize("category", ["output_truncated", "request_too_large"])
+def test_a_non_retryable_category_gets_exactly_one_attempt(category):
+    import llm_client
+
+    attempts = []
+
+    def fail(self, request):
+        attempts.append(request.purpose)
+        raise llm_client.ProviderError(category, f"simulated {category}")
+
+    transport = _stub_groq(generate=fail)
+    with pytest.raises(llm_client.ProviderError) as raised:
+        transport.generate(llm_client.Request("assessment", "p"))
+    assert attempts == ["assessment"], attempts
+    assert raised.value.category == category
+
+
+@pytest.mark.parametrize("category", ["rate_limited", "server_error"])
+def test_transient_categories_still_retry(category, monkeypatch):
+    import llm_client
+
+    monkeypatch.setattr(llm_client.time, "sleep", lambda _s: None)
+    attempts = []
+
+    def fail(self, request):
+        attempts.append(category)
+        raise llm_client.ProviderError(category, f"simulated {category}")
+
+    transport = _stub_groq(generate=fail)
+    with pytest.raises(llm_client.ProviderError):
+        transport.generate(llm_client.Request("assessment", "p"))
+    assert len(attempts) == llm_client.GROQ_MAX_ATTEMPTS, attempts
+
+
+def test_a_truncated_audit_becomes_unavailable_not_a_failed_run(run, c3):
+    """The audit degrades to UNKNOWN; the run is untouched."""
+    import logging
+
+    class _Truncating:
+        name = "truncating"
+
+        def generate(self, request):
+            import llm_client
+
+            if request.purpose == "assessment":
+                raise llm_client.ProviderError("output_truncated", "output cap reached")
+            assert request.purpose == "company_research", request.purpose
+            return llm_client.Reply(json.dumps(
+                {"company_visa_sponsorship": "UNKNOWN",
+                 "company_stem_opt_support": "UNKNOWN", "job_posted": "UNKNOWN",
+                 "checked_at": "2026-09-15", "sources": []}), self.name)
+
+    import llm_client
+    transport = _Truncating()
+    client = llm_client.LLMClient(transport, transport, run["master"], run["policy"],
+                                   logging.getLogger("test"), audit=transport)
+    signals = c3_signals(c3)
+    decision = engine.select_experience(run["template"], run["policy"], signals)
+    ids = ["lms", "pintos", "temp"]
+    audits = run_pipeline.run_audits(
+        client, c3["jd"], signals, decision, policy=run["policy"], master=run["master"],
+        selection=_selection(ids), chosen=[run["master"].project(p) for p in ids],
+        project_bullets={p: ["b"] for p in ids}, display_order=ids,
+        allocation={"lms": 3, "pintos": 2, "temp": 2}, skills=["Python"],
+        experience_plain=["x"], requirements=c3["requirements"], tailoring={},
+        extra_experience=[], log=run_pipeline.StageLog(logging.getLogger("t"), "T"))
+
+    assert "output_truncated" in audits["errors"]["application_audit"]
+    report = run_pipeline.assessment_report(audits, 9.5)
+    assert report["Resume Tailoring Score"] == "UNKNOWN"
+    assert report["Fit Match Score"] == "UNKNOWN"
+    # The Experience score lives in the failed audit now, so it degrades with
+    # it; research and the deterministic letter score are untouched.
+    assert report["Experience Selection Score"] == "UNKNOWN"
+    assert report["Company Visa Sponsorship"] == "UNKNOWN"
+    assert report["Cover Letter Score"] == "9.5 / 10"
+
+
+# ---- 5. budget accounting on the failure paths ---------------------------
+
+def test_usage_from_a_truncated_completion_replaces_the_estimate():
+    """The tokens were spent even though the answer was unusable."""
+    import llm_client
+
+    budget, _ = _budget(100000)
+
+    def truncate(self, request):
+        self.last_usage = 2450          # what Groq actually billed
+        raise llm_client.ProviderError("output_truncated", "output cap reached")
+
+    transport = _stub_groq(generate=truncate, budget=budget)
+    request = llm_client.Request("assessment", "p" * 6000, max_tokens=2600)
+    estimate = llm_client.estimate_tokens(request)
+    with pytest.raises(llm_client.ProviderError):
+        transport.generate(request)
+    assert sum(t for _, t in budget.used) == 2450, budget.used
+    assert estimate not in [t for _, t in budget.used]
+
+
+def test_a_413_rejected_before_generation_releases_its_reservation():
+    """Nothing was consumed, so the window must not hold the estimate."""
+    import llm_client
+
+    budget, _ = _budget(100000)
+
+    def reject(self, request):
+        raise llm_client.ProviderError("request_too_large", "Request too large")
+
+    transport = _stub_groq(generate=reject, budget=budget)
+    with pytest.raises(llm_client.ProviderError):
+        transport.generate(llm_client.Request("assessment", "p" * 6000, max_tokens=2600))
+    assert budget.used == [], budget.used
+
+
+def test_a_transient_failure_keeps_its_reservation(monkeypatch):
+    """A 5xx may well have cost tokens, so the estimate stands."""
+    import llm_client
+
+    monkeypatch.setattr(llm_client.time, "sleep", lambda _s: None)
+    budget, _ = _budget(1_000_000)
+
+    def fail(self, request):
+        raise llm_client.ProviderError("server_error", "500")
+
+    transport = _stub_groq(generate=fail, budget=budget)
+    request = llm_client.Request("assessment", "p" * 6000, max_tokens=2600)
+    with pytest.raises(llm_client.ProviderError):
+        transport.generate(request)
+    # One reservation per attempt, none released.
+    assert len(budget.used) == llm_client.GROQ_MAX_ATTEMPTS
+    assert all(t == llm_client.estimate_tokens(request) for _, t in budget.used)
+
+
+def test_release_only_drops_a_matching_reservation():
+    budget, _ = _budget(100000)
+    budget.record(1000)
+    budget.record(2000)
+    budget.release(2000)
+    assert [t for _, t in budget.used] == [1000]
+    budget.release(9999)                 # nothing matches; nothing is dropped
+    assert [t for _, t in budget.used] == [1000]
+
+
+# ---- unchanged guarantees -------------------------------------------------
+
+def test_company_research_path_is_functionally_unchanged(run, c3):
+    """Browsing works live now: json off, web search on, tool use forced."""
+    import llm_client
+
+    research = _captured_audit_requests(run, c3)["company_research"]
+    assert research.json is False
+    assert research.web_search is True
+    assert research.max_tokens == 1000
+    assert research.reasoning_effort == "low"
+    source = Path(llm_client.__file__).read_text(encoding="utf-8")
+    generate = source.split("def _generate(self, request: Request) -> str:")[1]
+    generate = generate.split("\n\n\n")[0]
+    assert 'settings["tool_choice"] = "required"' in generate
+    assert 'settings["tools"] = [{"type": "browser_search"}]' in generate
+
+
+def test_the_audits_are_still_groq_only_after_these_changes():
+    source = Path(_llm_client().__file__).read_text(encoding="utf-8")
+    for purpose, transport in (("assessment", "self.audit"),
+                               ("company_research", "self.research")):
+        head = source.split(f'"{purpose}", ')[0]
+        assert head.rsplit("self._invoke(", 1)[1].split(",")[0].strip() == transport
+    builder = source.split("def build_client(")[1]
+    assert "assessor = GroqTransport(credentials, log, model=assessment_model(), " \
+           "fallback=None)" in builder
+    assert "researcher = GroqTransport(credentials, log, model=research_model(), " \
+           "fallback=None)" in builder
+
+
+# ============================= AI. semantic JD signals, one Gemini call
+#
+# The deterministic classifier is keyword-driven and misses semantics: a
+# posting that says "participate in design and code reviews" is
+# code-quality-heavy without using a term it matches. Gemini reports OUR
+# taxonomy from the JD in the SAME call that picks projects, Python validates
+# the evidence, merges by OR, and then applies its own Experience policy.
+
+# A posting whose code-quality emphasis is purely semantic: no term the
+# deterministic detector looks for, but unmistakable to a reader.
+SEMANTIC_JD = """Company: Meridian Systems
+Job Title: Software Engineer
+
+About the role
+You will join a small platform group that ships Python services. We care a great deal
+about how work gets done: you will participate in design and code reviews, help
+establish engineering best practices across the group, and pair with teammates when a
+change touches unfamiliar ground. We expect engineers to leave the codebase clearer
+than they found it and to give thoughtful written feedback on each other's changes.
+
+Requirements
+Experience building services in Python. Comfort with relational databases and REST
+interfaces. Strong written communication.
+"""
+
+
+def _semantic_payload(signal: str, evidence: list[str]) -> dict:
+    return {signal: {"present": True, "evidence": evidence}}
+
+
+# ---- one call, two jobs ---------------------------------------------------
+
+def test_project_selection_is_still_exactly_one_gemini_call(run, c3):
+    import logging
+
+    import llm_client
+
+    transport = _RecordingTransport({"project_selection": {
+        "role_family": "backend", "career_stage": "early_career",
+        "selected": [{"project_id": pid, "llm_rank": rank, "reason": "r"}
+                     for rank, pid in enumerate(("lms", "pintos", "temp"), start=1)],
+        "considered": [],
+        "semantic_jd_signals": {"backend": {"present": False, "evidence": []}},
+    }})
+    client = llm_client.LLMClient(transport, transport, run["master"], run["policy"],
+                                   logging.getLogger("test"), audit=transport)
+    selection = client.select_projects(c3["jd"].text, c3_signals(c3), 3)
+    assert len(transport.requests) == 1, "semantic signals must not cost a second call"
+    assert transport.requests[0].purpose == "project_selection"
+    assert selection.selected == ["lms", "pintos", "temp"]
+    assert selection.semantic_signals_raw == {
+        "backend": {"present": False, "evidence": []}}
+
+
+def test_the_selection_prompt_asks_for_the_fixed_taxonomy_only(run, c3):
+    import logging
+
+    import llm_client
+
+    transport = _RecordingTransport({})
+    client = llm_client.LLMClient(transport, transport, run["master"], run["policy"],
+                                   logging.getLogger("test"), audit=transport)
+    try:
+        client.select_projects(c3["jd"].text, c3_signals(c3), 3)
+    except Exception:                        # noqa: BLE001 - empty payload
+        pass
+    prompt = transport.requests[0].prompt
+    assert "SEMANTIC JD SIGNALS" in prompt
+    for name in grounding.SEMANTIC_SIGNAL_NAMES:
+        assert name in prompt, name
+    assert "COPIED VERBATIM" in prompt
+    # It must be told it has no authority over Experience at all.
+    assert "bullet ids" in prompt
+    assert "yours to choose" in prompt
+
+
+# ---- validation -----------------------------------------------------------
+
+def test_only_predefined_signal_names_are_accepted():
+    validated, problems = grounding.validate_semantic_signals(
+        {"backend": {"present": False, "evidence": []},
+         "vibes": {"present": True, "evidence": ["you will join a small platform group"]}},
+        SEMANTIC_JD)
+    assert "vibes" not in validated
+    assert any("unknown semantic signal" in p.message for p in problems)
+    assert set(validated) <= set(grounding.SEMANTIC_SIGNAL_NAMES)
+
+
+def test_a_positive_signal_requires_grounded_jd_evidence():
+    grounded = grounding.validate_semantic_signals(
+        _semantic_payload("code_quality_collaboration_heavy",
+                          ["participate in design and code reviews"]), SEMANTIC_JD)[0]
+    assert grounded["code_quality_collaboration_heavy"] is True
+
+    # No evidence at all.
+    bare, problems = grounding.validate_semantic_signals(
+        {"code_quality_collaboration_heavy": {"present": True, "evidence": []}},
+        SEMANTIC_JD)
+    assert bare["code_quality_collaboration_heavy"] is False
+    assert any("requires 1-" in p.message for p in problems)
+
+
+def test_hallucinated_evidence_is_rejected():
+    validated, problems = grounding.validate_semantic_signals(
+        _semantic_payload("healthcare",
+                          ["we build clinical decision support for hospitals"]),
+        SEMANTIC_JD)
+    assert validated["healthcare"] is False
+    assert any("none of its evidence appears" in p.message for p in problems)
+    # A paraphrase of something real is still not a quote.
+    paraphrase = grounding.validate_semantic_signals(
+        _semantic_payload("code_quality_collaboration_heavy",
+                          ["the team values reviewing code carefully"]), SEMANTIC_JD)[0]
+    assert paraphrase["code_quality_collaboration_heavy"] is False
+
+
+@pytest.mark.parametrize("payload", [
+    None, [], "text", {"backend": "yes"}, {"backend": {"present": "maybe"}},
+    {"backend": {"present": True, "evidence": [7]}},
+])
+def test_a_malformed_payload_never_crashes_generation(payload):
+    validated, problems = grounding.validate_semantic_signals(payload, SEMANTIC_JD)
+    assert isinstance(validated, dict)
+    assert all(isinstance(v, bool) for v in validated.values())
+    assert all(p.severity == "warning" for p in problems)
+
+
+# ---- merge policy ---------------------------------------------------------
+
+def test_gemini_false_can_never_withdraw_a_deterministic_true():
+    master = engine.load_master()
+    signals = engine.classify_jd(engine.read_jd(EPIC_JD).text, master.section_order)
+    assert signals.healthcare is True, "fixture assumption"
+    merged, overrides = grounding.merge_semantic_signals(
+        signals, {"healthcare": False, "code_quality_collaboration_heavy": False})
+    assert merged["healthcare"] is True
+    assert overrides["added"] == []
+    # And the Signals object handed to the policy is the untouched original.
+    assert grounding.apply_semantic_overrides(signals, overrides) is signals
+    assert engine.experience_rule_for(signals)[0].startswith("Healthcare")
+
+
+def test_validated_gemini_true_supplements_a_missed_deterministic_signal():
+    master = engine.load_master()
+    signals = engine.classify_jd(SEMANTIC_JD, master.section_order)
+    # The deterministic detector genuinely misses it: that is the premise.
+    assert signals.code_quality is False, "fixture must be a real recall gap"
+
+    validated, problems = grounding.validate_semantic_signals(
+        _semantic_payload("code_quality_collaboration_heavy",
+                          ["participate in design and code reviews",
+                           "establish engineering best practices"]), SEMANTIC_JD)
+    assert problems == [] and validated["code_quality_collaboration_heavy"] is True
+
+    merged, overrides = grounding.merge_semantic_signals(signals, validated)
+    assert merged["code_quality_collaboration_heavy"] is True
+    assert overrides["added"] == ["code_quality_collaboration_heavy"]
+    assert overrides["fields"] == {"code_quality": True}
+
+
+def test_the_recovered_signal_fires_the_existing_python_pr_review_rule():
+    """End of the chain: the EXISTING approved swap, chosen by Python."""
+    master, policy = engine.load_master(), engine.load_policy()
+    template = engine.load_template()
+    signals = engine.classify_jd(SEMANTIC_JD, master.section_order)
+    validated = grounding.validate_semantic_signals(
+        _semantic_payload("code_quality_collaboration_heavy",
+                          ["participate in design and code reviews"]), SEMANTIC_JD)[0]
+    _merged, overrides = grounding.merge_semantic_signals(signals, validated)
+    merged_signals = grounding.apply_semantic_overrides(signals, overrides)
+
+    before = engine.select_experience(template, policy, signals)
+    after = engine.select_experience(template, policy, merged_signals)
+
+    assert engine.experience_rule_for(merged_signals) == (
+        "Non-healthcare + code-quality/collaboration-heavy", "jd_signal")
+    assert after.rule != before.rule
+    # The EXISTING approved PR-review swap, by id, from the spreadsheet.
+    targets = {target for _source, target, _rule in after.swaps}
+    assert any("PR-REVIEW" in t for t in targets), after.swaps
+    assert after.shipped_ids != before.shipped_ids
+    # Every shipped line is approved wording, byte for byte. A swapped bullet
+    # ships its TARGET's approved text, so the whole approved pool is the
+    # contract rather than the source id's own wording.
+    approved = {e.latex for e in policy.experience_library}
+    approved |= {e.latex for e in policy.alternate_library}
+    for bullet_id, _action, latex in after.shipped:
+        assert latex in approved, f"{bullet_id} shipped unapproved wording"
+
+
+def test_gemini_never_selects_or_writes_experience():
+    """Nothing in the semantic path can name a bullet or supply wording."""
+    import llm_client
+
+    master, policy = engine.load_master(), engine.load_policy()
+    ids = {e.bullet_id for e in policy.experience_library}
+    ids |= {e.bullet_id for e in policy.alternate_library}
+
+    # 1. Even a payload that tries to name bullets cannot: names are rejected.
+    validated, problems = grounding.validate_semantic_signals(
+        {"SWE-ALT-PR-REVIEW": {"present": True, "evidence": ["code reviews"]},
+         "experience": {"present": True, "evidence": ["SWE-4"]}}, SEMANTIC_JD)
+    assert validated == {}
+    assert len(problems) == 2
+
+    # 2. The merge output is booleans only - there is no channel for text.
+    signals = engine.classify_jd(SEMANTIC_JD, master.section_order)
+    merged, overrides = grounding.merge_semantic_signals(
+        signals, {"code_quality_collaboration_heavy": True})
+    assert all(isinstance(v, bool) for v in merged.values())
+    assert set(overrides) == {"fields", "role_family", "added"}
+    assert not (ids & set(overrides["fields"]))
+
+    # 3. The selection prompt never shows Experience, so it cannot echo it.
+    source = Path(llm_client.__file__).read_text(encoding="utf-8")
+    selection = source.split("def select_projects(")[1].split("    def write_bullets(")[0]
+    for bullet_id in ids:
+        assert bullet_id not in selection, bullet_id
+    assert "experience_library" not in selection
+    assert "alternate_library" not in selection
+
+
+def test_gemini_may_only_promote_a_role_family_never_replace_one():
+    master = engine.load_master()
+    signals = engine.classify_jd(engine.read_jd(C3_JD).text, master.section_order)
+    assert signals.domain_scores, "fixture assumption: a family was detected"
+    _merged, overrides = grounding.merge_semantic_signals(
+        signals, {"data_engineering": True})
+    # A detected family is never displaced by a model's opinion.
+    assert overrides["role_family"] is None
+    assert grounding.apply_semantic_overrides(signals, overrides).role_family == \
+        signals.role_family
+
+
+def test_the_merge_only_reaches_the_experience_policy():
+    """Project selection, bullets, skills and order use deterministic signals."""
+    source = Path(run_pipeline.__file__).read_text(encoding="utf-8")
+    run_one = source.split("def run_one(")[1].split("\ndef ")[0]
+    assert run_one.count("merged_signals") >= 1
+    # The only consumer is select_experience.
+    for line in run_one.splitlines():
+        if "merged_signals" in line and "=" not in line.split("merged_signals")[0]:
+            continue
+    assert "engine.select_experience(template, policy, merged_signals)" in run_one
+    # Everything else still takes `signals`.
+    assert "client.select_projects(jd.text, signals," in run_one
+    assert "master.section_order.order_for(signals.section_mode)" in run_one
+
+
+def test_strategy_records_every_signal_stage_separately():
+    folders = sorted((ROOT / "output" / "_smoke_tests").glob("C3_AI_*"))
+    if not folders:
+        pytest.skip("no C3 smoke folder; run the C3 mock first")
+    strategy = json.loads((folders[-1] / "strategy.json").read_text(encoding="utf-8"))
+    block = strategy["jd_signals"]
+    for key in ("deterministic_signals", "gemini_semantic_signals_raw",
+                "gemini_semantic_signals_validated", "merged_signals",
+                "recovered_by_gemini"):
+        assert key in block, key
+    assert strategy["experience"]["rule_fired"]
+    assert strategy["experience"]["shipped_ids"]
+    assert "resolved_from" in strategy["experience"]
+
+
+# ---- cover letter is Gemini's --------------------------------------------
+
+def test_the_cover_letter_goes_to_gemini_and_never_to_groq(run, bae):
+    import logging
+
+    import llm_client
+
+    gemini = _SequenceTransport([_letter_body("590,540 transactions")])
+    groq = _RecordingTransport({})
+    client = llm_client.LLMClient(gemini, groq, run["master"], run["policy"],
+                                   logging.getLogger("test"), audit=groq, research=groq)
+    letter, _problems = _letter_call(client, run, bae)
+    assert letter
+    assert [r.purpose for r in gemini.requests] == ["cover_letter"]
+    assert groq.requests == [], "Groq must never receive a cover-letter request"
+    assert [c.purpose for c in client.calls] == ["cover_letter"]
+
+
+def test_no_groq_transport_can_receive_a_cover_letter_request():
+    source = Path(_llm_client().__file__).read_text(encoding="utf-8")
+    head = source.split('"cover_letter", prompt')[0]
+    assert head.rsplit("self._invoke(", 1)[1].split(",")[0].strip() == "self.gemini"
+
+
+# ================== AJ. parallel audits, single writer, atomic persistence
+#
+# The two Groq audits hit different models and run concurrently. That makes
+# the write path the dangerous part: two threads updating strategy.json would
+# lose one another's work. The workers are therefore pure - they return result
+# objects - and the coordinator performs exactly one atomic write.
+
+def _code_only(text: str) -> str:
+    """Source with docstrings and comments stripped, for contract scans.
+
+    The prose in this pipeline names the things it promises NOT to do, so a
+    substring scan has to look at the code alone.
+    """
+    quote = chr(34) * 3
+    parts = text.split(quote)
+    # Keep the even-indexed parts: the odd ones are docstring bodies.
+    code = "".join(parts[::2])
+    return "\n".join(line.split("#")[0] for line in code.splitlines())
+
+
+def _research_payload(**overrides) -> dict:
+    payload = {"company_visa_sponsorship": "UNKNOWN", "company_visa_confidence": "LOW",
+               "company_stem_opt_support": "UNKNOWN", "company_stem_opt_confidence": "LOW",
+               "job_posted": "UNKNOWN", "job_posted_confidence": "LOW",
+               "checked_at": "2026-09-16", "sources": []}
+    payload.update(overrides)
+    return payload
+
+
+def _assessment_payload_for(c3) -> dict:
+    ids = [r.requirement_id for r in engine.scored_requirements(c3["requirements"])]
+    return {
+        "fit_score": 7.4, "recommendation": "apply",
+        "summary": "Most scored requirements are evidenced.",
+        "eligibility": {"status": "uncertain", "details": []},
+        "strong_matches": [{"requirement_id": ids[0], "evidence": "shipped evidence",
+                            "source": "experience"}],
+        "partial_matches": [], "gaps": [], "manual_review": [],
+        "complementary_strengths": [],
+        "tailoring_quality": {"score": 9.0, "notes": ["well tailored"]},
+        "experience_selection": {"score": 8.4, "notes": ["the rule fits"]},
+        "project_selection": {"score": 8.5, "components": {}, "notes": []},
+        "project_bullets": {"score": 8.6, "components": {}, "notes": []},
+        "callback_likelihood": "MEDIUM", "risk_flags": [],
+    }
+
+
+class _AuditTransport:
+    """Serves the two audit purposes, optionally slowly or by failing."""
+
+    name = "audit-stub"
+
+    def __init__(self, payloads: dict, *, delays: dict | None = None,
+                 fail: dict | None = None):
+        self.payloads = payloads
+        self.delays = delays or {}
+        self.fail = fail or {}
+        self.started: list[str] = []
+        self.finished: list[str] = []
+        import threading
+
+        self._lock = threading.Lock()
+
+    def generate(self, request):
+        import llm_client
+
+        with self._lock:
+            self.started.append(request.purpose)
+        if self.delays.get(request.purpose):
+            time.sleep(self.delays[request.purpose])
+        with self._lock:
+            self.finished.append(request.purpose)
+        if request.purpose in self.fail:
+            raise llm_client.ProviderError("server_error", self.fail[request.purpose])
+        return llm_client.Reply(json.dumps(self.payloads[request.purpose]), self.name)
+
+
+def _run_audits(run, c3, transport, *, log_name="T"):
+    import logging
+
+    import llm_client
+
+    client = llm_client.LLMClient(transport, transport, run["master"], run["policy"],
+                                   logging.getLogger(log_name), audit=transport,
+                                   research=transport)
+    signals = c3_signals(c3)
+    decision = engine.select_experience(run["template"], run["policy"], signals)
+    ids = ["lms", "pintos", "temp"]
+    return client, run_pipeline.run_audits(
+        client, c3["jd"], signals, decision, policy=run["policy"], master=run["master"],
+        selection=_selection(ids), chosen=[run["master"].project(p) for p in ids],
+        project_bullets={p: ["a bullet"] for p in ids}, display_order=ids,
+        allocation={"lms": 3, "pintos": 2, "temp": 2}, skills=["Python"],
+        experience_plain=["x"], requirements=c3["requirements"], tailoring={},
+        extra_experience=[],
+        log=run_pipeline.StageLog(logging.getLogger(log_name), log_name),
+        experience_context={"merged_signals": {"backend": True}, "rule": "R",
+                            "swaps": [], "shipped_ids": list(decision.shipped_ids)})
+
+
+# ---- the two audits really do overlap ------------------------------------
+
+def test_both_audits_are_submitted_before_either_is_awaited(run, c3):
+    """If they were sequential, the slow one would finish before the fast one starts."""
+    transport = _AuditTransport(
+        {"assessment": _assessment_payload_for(c3), "company_research": _research_payload()},
+        delays={"assessment": 0.35})
+    _client, audits = _run_audits(run, c3, transport)
+
+    assert audits["errors"] == {}
+    # research STARTED while the slow assessment was still running, and
+    # finished first - impossible if the calls were serialized.
+    assert set(transport.started) == {"assessment", "company_research"}
+    assert transport.finished[0] == "company_research", transport.finished
+    assert transport.started.index("company_research") <= 1
+
+
+def test_the_coordinator_uses_two_workers():
+    source = Path(run_pipeline.__file__).read_text(encoding="utf-8")
+    block = source.split("def run_audits(")[1].split("\ndef ")[0]
+    assert "ThreadPoolExecutor(max_workers=2)" in block
+    # Submitted first, awaited afterwards.
+    submit = block.index("pool.submit(")
+    await_at = block.index(".result()")
+    assert submit < await_at, "futures must be submitted before either is awaited"
+    assert block.count("pool.submit(") == 2
+
+
+def test_output_order_is_deterministic_whichever_future_finishes_first(run, c3):
+    fast_research = _AuditTransport(
+        {"assessment": _assessment_payload_for(c3), "company_research": _research_payload()},
+        delays={"assessment": 0.25})
+    slow_research = _AuditTransport(
+        {"assessment": _assessment_payload_for(c3), "company_research": _research_payload()},
+        delays={"company_research": 0.25})
+    _c1, first = _run_audits(run, c3, fast_research)
+    _c2, second = _run_audits(run, c3, slow_research)
+
+    assert list(first) == list(second), "key order must not depend on timing"
+    assert first["application_audit"] == second["application_audit"]
+    assert first["research"] == second["research"]
+    assert run_pipeline.assessment_report(first, 9.5) == \
+        run_pipeline.assessment_report(second, 9.5)
+
+
+@pytest.mark.parametrize("failing, surviving", [
+    ("assessment", "company_research"),
+    ("company_research", "assessment"),
+])
+def test_one_failing_future_never_cancels_the_other(run, c3, failing, surviving):
+    transport = _AuditTransport(
+        {"assessment": _assessment_payload_for(c3), "company_research": _research_payload()},
+        fail={failing: "simulated outage"})
+    _client, audits = _run_audits(run, c3, transport)
+
+    # Both calls were still MADE; only one failed.
+    assert sorted(transport.started) == ["assessment", "company_research"]
+    key = {"assessment": "application_audit", "company_research": "company_research"}
+    assert key[failing] in audits["errors"]
+    assert key[surviving] not in audits["errors"]
+    report = run_pipeline.assessment_report(audits, 9.5)
+    if failing == "assessment":
+        assert report["Fit Match Score"] == "UNKNOWN"
+        assert report["Company Visa Sponsorship"] == "UNKNOWN"   # honest UNKNOWN
+    else:
+        assert report["Fit Match Score"] == "7.4 / 10"
+    # Advisory either way: the letter score never depended on a provider.
+    assert report["Cover Letter Score"] == "9.5 / 10"
+
+
+# ---- single writer --------------------------------------------------------
+
+def test_the_audit_workers_write_no_artifact_at_all():
+    """Source contract: nothing inside run_audits touches the filesystem."""
+    source = Path(run_pipeline.__file__).read_text(encoding="utf-8")
+    block = source.split("def run_audits(")[1].split("\ndef ")[0]
+    # Scan the CODE, not the prose that explains the contract.
+    code = _code_only(block)
+    for forbidden in ("write_text", "write_json_atomic", "json.dump", "open(",
+                      "assessment.txt", "strategy.json", "Tracker(", "os.replace"):
+        assert forbidden not in code, f"run_audits must not reference {forbidden}"
+    # The workers are pure functions that RETURN their result.
+    for worker in ("def application_worker()", "def research_worker()"):
+        body = _code_only(
+            block.split(worker)[1].split("\n    def ")[0].split("\n    out")[0])
+        assert "return client." in body, worker
+        # The only thing a worker does is call the provider and hand back the
+        # reply: no filesystem verb appears in its body.
+        for verb in ("write", "dump", "replace", "unlink", "mkdir"):
+            assert verb not in body, f"{worker} touches {verb}"
+
+
+def test_the_workers_receive_copies_not_the_live_structures(run, c3):
+    """A worker cannot mutate what the coordinator or caller still uses."""
+    source = Path(run_pipeline.__file__).read_text(encoding="utf-8")
+    block = source.split("def run_audits(")[1].split("\ndef ")[0]
+    assert "context_copy = dict(experience_context or {})" in block
+    assert "catalogue_copy = [dict(entry) for entry in catalogue]" in block
+    assert "bullets_copy = {pid: list(values)" in block
+    # No `strategy` parameter exists at all, so no writable strategy can be
+    # handed to a worker by accident.
+    signature = source.split("def run_audits(")[1].split(") -> dict:")[0]
+    assert "strategy" not in signature
+
+
+def test_strategy_json_is_written_exactly_once_per_run():
+    source = Path(run_pipeline.__file__).read_text(encoding="utf-8")
+    # One write in the generation path, one in --assess, both atomic.
+    assert source.count("write_json_atomic(") == 3      # definition + 2 call sites
+    assert 'strategy_path.write_text' not in source
+    assert 'json.dumps(strategy' not in source
+    for block_name in ("def run_one(", "def assess_run("):
+        block = source.split(block_name)[1].split("\ndef ")[0]
+        assert block.count("write_json_atomic(") == 1, block_name
+
+
+def test_both_audit_results_survive_the_merge_in_either_order(run, c3):
+    for delays in ({"assessment": 0.2}, {"company_research": 0.2}):
+        transport = _AuditTransport(
+            {"assessment": _assessment_payload_for(c3),
+             "company_research": _research_payload(job_posted="2026-09-01",
+                                                   job_posted_confidence="HIGH")},
+            delays=delays)
+        _client, audits = _run_audits(run, c3, transport)
+        # Neither result is lost, whichever thread got there first.
+        assert audits["application_audit"]["experience_selection_score"] == 8.4
+        assert audits["research"]["job_posted"] == "2026-09-01"
+        report = run_pipeline.assessment_report(audits, 9.0)
+        assert report["Experience Selection Score"] == "8.4 / 10"
+        assert report["Job Posted"] == "2026-09-01"
+
+
+# ---- atomic persistence ---------------------------------------------------
+
+def test_the_atomic_writer_leaves_valid_json(tmp_path):
+    target = tmp_path / "strategy.json"
+    run_pipeline.write_json_atomic(target, {"a": 1, "nested": {"b": [1, 2]}})
+    assert json.loads(target.read_text(encoding="utf-8")) == {"a": 1, "nested": {"b": [1, 2]}}
+    # Rewriting replaces cleanly and leaves no temp files behind.
+    run_pipeline.write_json_atomic(target, {"a": 2})
+    assert json.loads(target.read_text(encoding="utf-8")) == {"a": 2}
+    assert list(tmp_path.iterdir()) == [target]
+
+
+def test_an_interrupted_write_keeps_the_previous_valid_strategy(tmp_path, monkeypatch):
+    target = tmp_path / "strategy.json"
+    run_pipeline.write_json_atomic(target, {"version": "good"})
+
+    class _Unserializable:
+        pass
+
+    # json.dump raises part-way through, after the temp file was created.
+    with pytest.raises(TypeError):
+        run_pipeline.write_json_atomic(target, {"version": "bad", "x": _Unserializable()})
+    assert json.loads(target.read_text(encoding="utf-8")) == {"version": "good"}
+    assert list(tmp_path.iterdir()) == [target], "the temp file must be cleaned up"
+
+    # And an interruption during os.replace leaves the original untouched too.
+    monkeypatch.setattr(run_pipeline.os, "replace",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("interrupted")))
+    with pytest.raises(OSError):
+        run_pipeline.write_json_atomic(target, {"version": "also bad"})
+    assert json.loads(target.read_text(encoding="utf-8")) == {"version": "good"}
+
+
+def test_the_writer_uses_a_process_unique_temp_name():
+    source = Path(run_pipeline.__file__).read_text(encoding="utf-8")
+    block = source.split("def write_json_atomic(")[1].split("\ndef ")[0]
+    assert "os.getpid()" in block
+    assert "os.replace(temp, path)" in block
+    assert "os.fsync(" in block
+    assert "path.with_name(" in block, "the temp must be in the SAME directory"
+
+
+# ---- the call shape after the refactor -----------------------------------
+
+def test_a_clean_run_makes_exactly_two_groq_calls():
+    folders = sorted((ROOT / "output" / "_smoke_tests").glob("C3_AI_*"))
+    if not folders:
+        pytest.skip("no C3 smoke folder; run the C3 mock first")
+    log = (folders[-1] / "run.log").read_text(encoding="utf-8")
+    purposes = re.findall(r"purpose=([a-z_]+)", log)
+    audits = [p for p in purposes if p in ("assessment", "company_research")]
+    assert sorted(audits) == ["assessment", "company_research"], audits
+    assert "experience_audit" not in purposes, "the third audit call must be gone"
+    # Gemini's five logical calls: selection, three bullet writers, the letter.
+    assert purposes.count("project_selection") == 1
+    assert purposes.count("cover_letter") == 1
+    assert purposes.count("project_bullets") >= 3
+
+
+def test_no_groq_experience_audit_remains_anywhere():
+    for module in (grounding, run_pipeline, _llm_client()):
+        source = Path(module.__file__).read_text(encoding="utf-8")
+        assert "audit_experience_selection" not in source, module.__name__
+        assert "experience_option_space" not in source, module.__name__
+    # The score itself survives, sourced from the final assessment.
+    assert "Experience Selection Score" in grounding.ASSESSMENT_FIELDS
+
+
+# ================== AK. research source scoping, keys, daily limits, --assess
+
+def _scoped(scope: str, evidence: str, title: str = "Source") -> dict:
+    return {"title": title, "url": "https://example.com/x", "scope": scope,
+            "evidence": evidence}
+
+
+# ---- source scoping -------------------------------------------------------
+
+def test_an_unrelated_posting_cannot_establish_a_company_level_no():
+    """The live C3 lesson: another team's requisition is not company policy."""
+    research, _ = grounding.validate_company_research(
+        {"company_visa_sponsorship": "NO", "company_visa_confidence": "HIGH",
+         "checked_at": "2026-09-16",
+         "sources": [_scoped("unrelated_posting",
+                             "This role does not offer visa sponsorship.",
+                             "A different job at the same company")]},
+        jd_text="We are hiring a backend engineer.")
+    assert research["company_visa_sponsorship"] == "UNKNOWN"
+    assert research["company_visa_confidence"] == "LOW"
+    assert any("cannot establish a company-wide position" in note
+               for note in research["deterministic_overrides"])
+
+
+def test_an_official_company_policy_can_establish_yes_or_no():
+    for verdict in ("YES", "NO"):
+        research, _ = grounding.validate_company_research(
+            {"company_visa_sponsorship": verdict, "company_visa_confidence": "HIGH",
+             "checked_at": "2026-09-16",
+             "sources": [_scoped("company_policy",
+                                 "Our published policy on work authorization.")]},
+            jd_text="We are hiring a backend engineer.")
+        assert research["company_visa_sponsorship"] == verdict
+
+
+def test_an_exact_job_restriction_overrides_a_company_level_yes():
+    research, _ = grounding.validate_company_research(
+        {"company_visa_sponsorship": "YES", "company_visa_confidence": "HIGH",
+         "checked_at": "2026-09-16",
+         "sources": [_scoped("company_policy", "We sponsor visas company-wide."),
+                     _scoped("this_job",
+                             "We are not able to sponsor visas for this position.")]},
+        jd_text="We are hiring a backend engineer.")
+    assert research["company_visa_sponsorship"] == "NO"
+    assert research["company_visa_confidence"] == "HIGH"
+    assert any("job-specific restriction overrides" in note
+               for note in research["deterministic_overrides"])
+
+
+def test_everify_inside_an_authoritative_source_still_cannot_prove_stem_opt():
+    research, _ = grounding.validate_company_research(
+        {"company_stem_opt_support": "YES", "company_stem_opt_confidence": "HIGH",
+         "checked_at": "2026-09-16",
+         "sources": [_scoped("company_policy",
+                             "We are an E-Verify participating employer.")]},
+        jd_text="We are hiring.")
+    assert research["company_stem_opt_support"] == "UNKNOWN"
+
+
+def test_scope_labels_are_normalized_and_unknown_scopes_become_context():
+    for raw, expected in (("this-job", "this_job"), ("Company Wide", "company_policy"),
+                          ("other_job", "unrelated_posting"), ("gossip", "context"),
+                          (None, "context")):
+        research, _ = grounding.validate_company_research(
+            {"checked_at": "x", "sources": [_scoped(raw, "some evidence here")]},
+            jd_text="We are hiring.")
+        assert research["sources"][0]["scope"] == expected, raw
+    assert grounding.SOURCE_SCOPES == ("this_job", "company_policy",
+                                       "unrelated_posting", "context")
+
+
+def test_the_research_prompt_demands_a_scope_per_source(run, c3):
+    request = _captured_audit_requests(run, c3)["company_research"]
+    assert "SOURCE SCOPING" in request.prompt
+    for scope in grounding.SOURCE_SCOPES:
+        assert scope in request.prompt, scope
+    assert "unrelated posting is supporting context only" in request.prompt
+
+
+# ---- key pool -------------------------------------------------------------
+
+def test_the_key_pool_is_deterministic_and_supports_both_schemes(monkeypatch, tmp_path):
+    import llm_client
+
+    monkeypatch.setattr(engine, "PROJECT_ROOT", tmp_path)
+    for name in ("GROQ_API_KEY", "GROQ_API_KEY_1", "GROQ_API_KEY_2"):
+        monkeypatch.delenv(name, raising=False)
+    (tmp_path / ".env").write_text(
+        "GROQ_API_KEY_1=first\nGROQ_API_KEY_2=second\nGROQ_API_KEY=legacy\n",
+        encoding="utf-8")
+    assert llm_client.groq_key_pool() == ("first", "second", "legacy")
+    # Stable across calls, and duplicates collapse.
+    (tmp_path / ".env").write_text("GROQ_API_KEY_1=same\nGROQ_API_KEY=same\n",
+                                   encoding="utf-8")
+    assert llm_client.groq_key_pool() == ("same",)
+    # Legacy alone still works.
+    (tmp_path / ".env").write_text("GROQ_API_KEY=only\n", encoding="utf-8")
+    assert llm_client.groq_key_pool() == ("only",)
+
+
+def test_a_rate_limit_never_rotates_the_key(monkeypatch):
+    """Two keys in one organization share every ceiling."""
+    import llm_client
+
+    monkeypatch.setattr(llm_client.time, "sleep", lambda _s: None)
+    seen: list[int] = []
+
+    def fail(self, request):
+        seen.append(self._key_index)
+        raise llm_client.ProviderError("rate_limited", "TPM exceeded")
+
+    transport = _stub_groq(generate=fail)
+    transport.keys = ("k1", "k2")
+    with pytest.raises(llm_client.ProviderError):
+        transport.generate(llm_client.Request("assessment", "p"))
+    assert set(seen) == {0}, "a rate limit must not spend the second key"
+    assert transport._key_index == 0
+
+
+@pytest.mark.parametrize("category", ["auth_permission", "invalid_key"])
+def test_a_key_specific_failure_rotates_once_per_key(category, monkeypatch):
+    import llm_client
+
+    monkeypatch.setattr(llm_client.time, "sleep", lambda _s: None)
+    seen: list[int] = []
+
+    def fail(self, request):
+        seen.append(self._key_index)
+        raise llm_client.ProviderError(category, "bad key")
+
+    transport = _stub_groq(generate=fail)
+    transport.keys = ("k1", "k2")
+    with pytest.raises(llm_client.ProviderError):
+        transport.generate(llm_client.Request("assessment", "p"))
+    # Each key is tried, and the loop is bounded: no infinite rotation.
+    assert seen == [0, 1], seen
+    assert len(seen) <= llm_client.GROQ_MAX_ATTEMPTS
+
+
+def test_keys_are_never_logged(run, c3):
+    import logging
+
+    import llm_client
+
+    records: list[str] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    logger = logging.getLogger("key-safety")
+    logger.addHandler(_Capture())
+    logger.setLevel(logging.INFO)
+    transport = llm_client.GroqTransport(_credentials(), logger, model="m",
+                                         fallback=None, keys=("supersecretkey",),
+                                         budget=llm_client.TokenBudget(999999))
+
+    def boom(request):
+        raise llm_client.ProviderError("server_error", "500")
+
+    transport._generate = boom
+    with pytest.raises(llm_client.ProviderError):
+        transport.generate(llm_client.Request("assessment", "p"))
+    joined = " ".join(records)
+    assert "supersecretkey" not in joined
+    assert "key=#1" in joined
+
+
+# ---- daily exhaustion is not transient -----------------------------------
+
+@pytest.mark.parametrize("body", [
+    "Rate limit reached: tokens per day (TPD) limit of 100000 exceeded",
+    "Rate limit reached for requests per day (RPD)",
+    "You have exhausted your daily quota",
+])
+def test_a_daily_ceiling_is_classified_and_never_retried(body, monkeypatch):
+    import llm_client
+
+    assert llm_client.classify_http(429, body) == "daily_limit_exhausted"
+    monkeypatch.setattr(llm_client.time, "sleep", lambda _s: None)
+    attempts = []
+
+    def fail(self, request):
+        attempts.append(1)
+        raise llm_client.ProviderError("daily_limit_exhausted", body)
+
+    transport = _stub_groq(generate=fail)
+    with pytest.raises(llm_client.ProviderError):
+        transport.generate(llm_client.Request("assessment", "p"))
+    assert attempts == [1], "a daily ceiling will not clear inside this run"
+
+
+def test_a_per_minute_limit_still_retries(monkeypatch):
+    import llm_client
+
+    monkeypatch.setattr(llm_client.time, "sleep", lambda _s: None)
+    assert llm_client.classify_http(
+        429, "Rate limit reached: tokens per minute (TPM)") == "rate_limited"
+    attempts = []
+
+    def fail(self, request):
+        attempts.append(1)
+        raise llm_client.ProviderError("rate_limited", "TPM")
+
+    transport = _stub_groq(generate=fail)
+    with pytest.raises(llm_client.ProviderError):
+        transport.generate(llm_client.Request("assessment", "p"))
+    assert len(attempts) == llm_client.GROQ_MAX_ATTEMPTS
+
+
+def test_the_non_retryable_set_is_explicit():
+    import llm_client
+
+    for category in ("request_too_large", "output_truncated", "daily_limit_exhausted"):
+        assert category in llm_client.NON_RETRYABLE_CATEGORIES, category
+    for category in ("rate_limited", "server_error", "transport"):
+        assert category not in llm_client.NON_RETRYABLE_CATEGORIES, category
+
+
+# ---- standalone --assess --------------------------------------------------
+
+def test_assess_loads_strategy_once_and_persists_it_once():
+    source = Path(run_pipeline.__file__).read_text(encoding="utf-8")
+    block = _code_only(source.split("def assess_run(")[1].split("\ndef ")[0])
+    assert block.count("strategy_path.read_text") == 1, "load exactly once"
+    assert block.count("write_json_atomic(") == 1, "persist exactly once"
+    assert "json.loads(strategy_path.read_text" in block
+    # And the audit workers still never write: assess_run delegates to the
+    # same coordinator the generation path uses.
+    assert "run_audits(" in block
+
+
+def test_assess_regenerates_assessment_txt_from_the_merged_results():
+    run_dir = _c3_smoke_folder()
+    result = run_pipeline.assess_run(run_dir, mock=True, console=False)
+    assert result.status == "success", result.issues
+    rendered = (run_dir / "assessment.txt").read_text(encoding="utf-8")
+    strategy = json.loads((run_dir / "strategy.json").read_text(encoding="utf-8"))
+    audit = strategy["audit"]
+    # Both halves of the merge are present in the persisted strategy.
+    assert audit["application"], "the assessment result is missing"
+    assert audit["company_research"], "the research result is missing"
+    # And assessment.txt is rendered from that same merged report.
+    assert rendered == grounding.render_assessment_txt(audit["report"])
+    assert audit["report"]["Experience Selection Score"] == grounding._fmt(
+        audit["application"].get("experience_selection_score"))
+
+
+# ============ AL. end-to-end: a recovered semantic signal changes Experience
+#
+# The whole point of the recall layer, proved through the real pipeline: a
+# posting whose code-quality emphasis is purely semantic ships the EXISTING
+# approved PR-review bullet, chosen by Python, with no model-authored wording
+# anywhere in Professional Experience.
+
+def test_end_to_end_a_recovered_signal_ships_the_approved_pr_review_bullet(
+        tmp_path, monkeypatch):
+    import llm_client
+
+    jd_path = tmp_path / "meridian.txt"
+    jd_path.write_text(SEMANTIC_JD, encoding="utf-8")
+    master, policy = engine.load_master(), engine.load_policy()
+    template = engine.load_template()
+
+    # Baseline: deterministic classification alone misses the signal.
+    signals = engine.classify_jd(SEMANTIC_JD, master.section_order)
+    assert signals.code_quality is False
+    baseline = engine.select_experience(template, policy, signals)
+
+    # The mock reads the posting semantically for this run, exactly as the
+    # live model is asked to: quote the phrase, claim the signal.
+    real_signals = llm_client.MockTransport._semantic_signals
+
+    def recovering(self, jd_text):
+        found = real_signals(self, jd_text)
+        if "participate in design and code reviews" in jd_text:
+            found["code_quality_collaboration_heavy"] = {
+                "present": True,
+                "evidence": ["participate in design and code reviews"]}
+        return found
+
+    monkeypatch.setattr(llm_client.MockTransport, "_semantic_signals", recovering)
+    result = run_pipeline.run_one(jd_path, mock=True, smoke=True, console=False)
+    assert result.status == "success", result.issues
+
+    strategy = result.strategy
+    block = strategy["jd_signals"]
+    # 1. Gemini's claim was validated, not merely trusted.
+    assert block["gemini_semantic_signals_validated"][
+        "code_quality_collaboration_heavy"] is True
+    assert block["deterministic_signals"]["code_quality_collaboration_heavy"] is False
+    assert block["merged_signals"]["code_quality_collaboration_heavy"] is True
+    assert block["recovered_by_gemini"] == ["code_quality_collaboration_heavy"]
+
+    # 2. PYTHON then applied its own existing rule.
+    assert strategy["experience"]["rule_fired"] == (
+        "Non-healthcare + code-quality/collaboration-heavy (jd_signal)")
+    assert strategy["experience"]["resolved_from"] == (
+        "merged deterministic + validated Gemini signals")
+    assert strategy["experience"]["shipped_ids"] != baseline.shipped_ids
+
+    # 3. The shipped bullet is the EXISTING approved PR-review variant, by id.
+    swapped = {row["target_id"] for row in strategy["experience"]["swaps"]}
+    assert any("PR-REVIEW" in target for target in swapped), swapped
+
+    # 4. No model-authored Experience wording exists. Every shipped line is
+    #    approved wording byte for byte, and it is what the PDF renders.
+    approved = {e.plain for e in policy.experience_library}
+    approved |= {e.plain for e in policy.alternate_library}
+    for row in strategy["experience"]["shipped"]:
+        assert row["text"] in approved, row["bullet_id"]
+    resume_text = (result.run_dir / "resume.txt").read_text(encoding="utf-8")
+
+    def flatten(text: str) -> str:
+        # pdftotext renders "-" as U+2212 and wraps lines; compare on letters.
+        return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+
+    flat = flatten(resume_text)
+    shipped_lines = [row["text"] for row in strategy["experience"]["shipped"]
+                     if not row["bullet_id"].startswith("ROLE-")]
+    assert shipped_lines
+    for text in shipped_lines:
+        assert flatten(text)[:60] in flat, text[:60]
+
+
+def test_end_to_end_an_unrecoverable_claim_changes_nothing(tmp_path, monkeypatch):
+    """Ungrounded evidence leaves the deterministic decision exactly as it was."""
+    import llm_client
+
+    jd_path = tmp_path / "meridian2.txt"
+    # A distinct company, so this run cannot overwrite the other test's folder.
+    jd_path.write_text(SEMANTIC_JD.replace("Meridian Systems", "Halyard Systems"),
+                       encoding="utf-8")
+    real_signals = llm_client.MockTransport._semantic_signals
+
+    def hallucinating(self, jd_text):
+        found = real_signals(self, jd_text)
+        found["healthcare"] = {"present": True,
+                               "evidence": ["we build clinical software for hospitals"]}
+        return found
+
+    monkeypatch.setattr(llm_client.MockTransport, "_semantic_signals", hallucinating)
+    result = run_pipeline.run_one(jd_path, mock=True, smoke=True, console=False)
+    assert result.status == "success", result.issues
+
+    block = result.strategy["jd_signals"]
+    assert block["gemini_semantic_signals_validated"]["healthcare"] is False
+    assert block["merged_signals"]["healthcare"] is False
+    assert block["recovered_by_gemini"] == []
+    assert any("none of its evidence appears" in note for note in block["rejected"])
+    assert result.strategy["experience"]["resolved_from"] == "deterministic signals only"
+    assert not result.strategy["experience"]["rule_fired"].startswith("Healthcare")
+
+
+# ===================== AM. OTPM: output tokens per minute is its own ceiling
+#
+# The first live run: Qwen accepted the request, then refused with
+# "OTPM Limit 1000, Requested 1178". That is the OUTPUT allowance, separate
+# from the combined 8K TPM budget, and it needs its own reservation.
+
+QWEN = "qwen/qwen3.8-27b"
+RESEARCHER = "openai/gpt-oss-20b"
+
+
+def _otpm_env(monkeypatch, tmp_path, **settings):
+    lines = [f"{k}={v}" for k, v in settings.items()]
+    (tmp_path / ".env").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    monkeypatch.setattr(engine, "PROJECT_ROOT", tmp_path)
+    for name in ("GROQ_OTPM_LIMIT", "GROQ_OTPM_LIMIT__QWEN_QWEN3_8_27B",
+                 "GROQ_OTPM_LIMIT__OPENAI_GPT_OSS_20B", "GROQ_TPM_LIMIT"):
+        monkeypatch.delenv(name, raising=False)
+    import llm_client
+
+    llm_client._MODEL_OUTPUT_BUDGETS.clear()
+
+
+# ---- 1/2. the cap itself --------------------------------------------------
+
+def test_the_assessment_reserves_at_most_900_completion_tokens(run, c3):
+    import llm_client
+
+    assert llm_client.AUDIT_OUTPUT_TOKENS["assessment"] <= 900
+    request = _captured_audit_requests(run, c3)["assessment"]
+    assert request.max_tokens == 900
+    # Research is deliberately untouched.
+    assert llm_client.AUDIT_OUTPUT_TOKENS["company_research"] == 1000
+
+
+def test_the_sdk_is_sent_max_completion_tokens_not_max_tokens():
+    source = Path(_llm_client().__file__).read_text(encoding="utf-8")
+    generate = source.split("def _generate(self, request: Request) -> str:")[1]
+    generate = generate.split("\n\n\n")[0]
+    assert "max_completion_tokens=request.max_tokens" in generate
+    assert "\n                max_tokens=" not in generate
+
+
+def test_the_assessment_sends_only_reasoning_effort_none(run, c3):
+    import llm_client
+
+    request = _captured_audit_requests(run, c3)["assessment"]
+    assert request.reasoning_effort == "none"
+    assert request.reasoning_format is None
+    assert request.include_reasoning is None
+
+    # Prove what the SDK would actually receive: reasoning_effort and nothing
+    # else from the reasoning family.
+    settings = {}
+    if request.json and not request.response_schema:
+        settings["response_format"] = {"type": "json_object"}
+    if request.response_schema:
+        settings["response_format"] = request.response_schema
+    if request.reasoning_effort:
+        settings["reasoning_effort"] = request.reasoning_effort
+    if request.reasoning_format:
+        settings["reasoning_format"] = request.reasoning_format
+    elif request.include_reasoning is not None:
+        settings["include_reasoning"] = request.include_reasoning
+    assert settings["reasoning_effort"] == "none"
+    assert "reasoning_format" not in settings
+    assert "include_reasoning" not in settings
+
+    # The two spellings remain mutually exclusive in the transport.
+    source = Path(llm_client.__file__).read_text(encoding="utf-8")
+    generate = source.split("def _generate(self, request: Request) -> str:")[1]
+    generate = generate.split("\n\n\n")[0]
+    assert 'settings["reasoning_format"] = request.reasoning_format' in generate
+    assert "elif request.include_reasoning is not None:" in generate
+
+
+def test_the_assessment_schema_fits_the_compact_contract():
+    """Ids-only buckets: the prose Python discards is no longer requested."""
+    ids = {f"REQ-{i:03d}" for i in range(1, 26)}
+    payload = {
+        "fit_score": 7.4, "recommendation": "apply",
+        "summary": "Most scored requirements are evidenced on the shipped resume.",
+        "eligibility": {"status": "uncertain", "details": []},
+        "strong_matches": [{"requirement_id": f"REQ-{i:03d}"} for i in range(1, 16)],
+        "partial_matches": [{"requirement_id": f"REQ-{i:03d}"} for i in range(16, 21)],
+        "gaps": [{"requirement_id": f"REQ-{i:03d}"} for i in range(21, 24)],
+        "manual_review": [{"requirement_id": f"REQ-{i:03d}"} for i in range(24, 26)],
+        "complementary_strengths": ["AWS", "PostgreSQL", "WebSockets"],
+        "tailoring_quality": {"score": 9.0, "notes": ["strong use of evidence"]},
+        "experience_selection": {"score": 8.5, "notes": ["the rule fits the posting"]},
+        "project_selection": {"score": 8.5, "components": {
+            "jd_relevance": 8.0, "best_available_chosen": 9.0,
+            "complementary_coverage": 8.0, "ranking_and_allocation": 9.0}, "notes": []},
+        "project_bullets": {"score": 8.6, "components": {
+            "jd_relevance": 9.0, "technical_specificity": 9.0, "evidence_fidelity": 10.0,
+            "impact_ownership": 8.0, "non_redundancy": 8.0}, "notes": []},
+        "callback_likelihood": "MEDIUM", "risk_flags": ["thin cloud evidence"],
+    }
+    # It validates completely with no per-entry prose at all.
+    assert grounding.errors(grounding.validate_assessment(
+        payload, "A posting.", ids)) == []
+    # Every field assessment.txt needs is present and readable.
+    audit, problems = grounding.validate_application_audit(payload)
+    assert problems == []
+    for key in ("experience_selection_score", "resume_tailoring_score",
+                "project_selection_score", "project_bullet_score",
+                "callback_likelihood"):
+        assert audit[key] is not None, key
+    # And it fits the budget with room to spare.
+    assert len(json.dumps(payload)) // 4 < 900
+
+    # A model that still volunteers an enum is held to it.
+    payload["strong_matches"][0]["source"] = "not-a-source"
+    assert grounding.errors(grounding.validate_assessment(payload, "A posting.", ids))
+    # An invented id is still rejected: that check is the point of the buckets.
+    payload["strong_matches"][0]["source"] = "experience"
+    payload["gaps"].append({"requirement_id": "REQ-999"})
+    problems = grounding.errors(grounding.validate_assessment(payload, "A posting.", ids))
+    assert any("unknown requirement_id" in p.message for p in problems)
+
+
+# ---- 3. the independent output budget ------------------------------------
+
+def test_qwen_has_an_independent_1000_token_output_budget(monkeypatch, tmp_path):
+    import llm_client
+
+    _otpm_env(monkeypatch, tmp_path, GROQ_OTPM_LIMIT__QWEN_QWEN3_8_27B="1000")
+    assert llm_client.model_otpm_limit(QWEN) == 1000
+    budget = llm_client.output_budget_for(QWEN)
+    assert budget is not None and budget.limit == 1000
+    # Separate object from the COMBINED budget for the same model.
+    assert budget is not llm_client.budget_for(QWEN)
+    # A model with no configured ceiling is not paced on output at all.
+    assert llm_client.output_budget_for(RESEARCHER) is None
+
+
+def test_a_global_otpm_fallback_is_honoured(monkeypatch, tmp_path):
+    import llm_client
+
+    _otpm_env(monkeypatch, tmp_path, GROQ_OTPM_LIMIT="1500")
+    assert llm_client.model_otpm_limit(QWEN) == 1500
+    assert llm_client.model_otpm_limit(RESEARCHER) == 1500
+    # A model-specific value still wins.
+    monkeypatch.setenv("GROQ_OTPM_LIMIT__QWEN_QWEN3_8_27B", "1000")
+    assert llm_client.model_otpm_limit(QWEN) == 1000
+    assert llm_client.model_otpm_limit(RESEARCHER) == 1500
+
+
+def test_qwens_output_budget_cannot_block_gpt_oss(monkeypatch, tmp_path):
+    import llm_client
+
+    _otpm_env(monkeypatch, tmp_path, GROQ_OTPM_LIMIT__QWEN_QWEN3_8_27B="1000")
+    qwen = llm_client.output_budget_for(QWEN)
+    qwen.record(1000)                     # the whole minute is spent
+    assert llm_client.output_budget_for(RESEARCHER) is None, "research is unpaced"
+
+    # Even when research DOES have a ceiling, it is a different bucket.
+    monkeypatch.setenv("GROQ_OTPM_LIMIT__OPENAI_GPT_OSS_20B", "6000")
+    llm_client._MODEL_OUTPUT_BUDGETS.pop(RESEARCHER, None)
+    research = llm_client.output_budget_for(RESEARCHER)
+    assert research is not qwen
+    slept: list[float] = []
+    research._sleep = lambda s: slept.append(s)
+    assert research.wait_for(1000) == 0.0
+    assert slept == [], "research paced on Qwen's output window"
+
+
+def test_two_rapid_assessments_are_paced_by_the_output_window(monkeypatch, tmp_path):
+    """900 + 900 exceeds 1000/min, so the second call waits for the window."""
+    import llm_client
+
+    _otpm_env(monkeypatch, tmp_path, GROQ_OTPM_LIMIT__QWEN_QWEN3_8_27B="1000")
+    state = {"now": 0.0, "slept": []}
+    budget = llm_client.output_budget_for(QWEN)
+    budget._sleep = lambda s: (state["slept"].append(s), state.__setitem__("now",
+                                                                          state["now"] + s))
+    budget._clock = lambda: state["now"]
+
+    calls = []
+
+    def answer(self, request):
+        calls.append(request.purpose)
+        self.last_output_usage = 880      # nearly the whole reservation
+        return "{}"
+
+    transport = _stub_groq(generate=answer, model=QWEN,
+                           budget=llm_client.TokenBudget(1_000_000))
+    transport.output_budget = budget
+    request = lambda: llm_client.Request(            # noqa: E731 - test brevity
+        "assessment", "p" * 3000, max_tokens=900, **llm_client.AUDIT_REASONING)
+
+    transport.generate(request())
+    assert state["slept"] == [], "the first call has the whole window"
+    transport.generate(request())
+    assert state["slept"], "the second call must wait for the output window"
+    assert sum(state["slept"]) == pytest.approx(60.0)
+    assert calls == ["assessment", "assessment"]
+
+
+def test_actual_output_usage_replaces_the_reservation(monkeypatch, tmp_path):
+    import llm_client
+
+    _otpm_env(monkeypatch, tmp_path, GROQ_OTPM_LIMIT__QWEN_QWEN3_8_27B="1000")
+    budget = llm_client.output_budget_for(QWEN)
+
+    def answer(self, request):
+        self.last_output_usage = 240      # far below the 900 cap
+        self.last_usage = 4000
+        return "{}"
+
+    transport = _stub_groq(generate=answer, model=QWEN,
+                           budget=llm_client.TokenBudget(1_000_000))
+    transport.output_budget = budget
+    transport.generate(llm_client.Request("assessment", "p" * 3000, max_tokens=900))
+    assert [t for _, t in budget.used] == [240], budget.used
+    # So a second call is NOT paced: 240 + 900 still fits 1000... just.
+    slept: list[float] = []
+    budget._sleep = lambda s: slept.append(s)
+    assert budget.wait_for(760) == 0.0
+    assert slept == []
+
+
+def test_a_refused_request_releases_its_output_reservation(monkeypatch, tmp_path):
+    import llm_client
+
+    _otpm_env(monkeypatch, tmp_path, GROQ_OTPM_LIMIT__QWEN_QWEN3_8_27B="1000")
+    budget = llm_client.output_budget_for(QWEN)
+
+    def refuse(self, request):
+        raise llm_client.ProviderError("output_rate_limited",
+                                       "Limit 1000, Requested 1178 OTPM")
+
+    transport = _stub_groq(generate=refuse, model=QWEN,
+                           budget=llm_client.TokenBudget(1_000_000))
+    transport.output_budget = budget
+    monkeypatch.setattr(llm_client.time, "sleep", lambda _s: None)
+    with pytest.raises(llm_client.ProviderError):
+        transport.generate(llm_client.Request("assessment", "p" * 3000, max_tokens=900))
+    # Nothing was generated, so nothing may sit in the output window.
+    assert budget.used == [], budget.used
+
+
+# ---- 4. classification ----------------------------------------------------
+
+@pytest.mark.parametrize("body", [
+    "Rate limit reached: Limit 1000, Requested 1178 on output tokens per minute (OTPM)",
+    "OTPM limit exceeded for this model",
+])
+def test_otpm_is_classified_separately_from_tpm(body):
+    import llm_client
+
+    assert llm_client.classify_http(429, body) == "output_rate_limited"
+    assert llm_client.classify_exception(Exception(body)) == "output_rate_limited"
+    # The combined ceiling and an oversize request keep their own categories.
+    assert llm_client.classify_http(
+        429, "tokens per minute (TPM): Limit 8000") == "rate_limited"
+    assert llm_client.classify_http(
+        413, "Request too large for model") == "request_too_large"
+    assert llm_client.classify_http(
+        429, "tokens per day (TPD) limit") == "daily_limit_exhausted"
+
+
+def test_a_cap_above_the_otpm_ceiling_is_a_configuration_error(monkeypatch, tmp_path):
+    """Retrying identical bytes cannot help; say so instead."""
+    import llm_client
+
+    _otpm_env(monkeypatch, tmp_path, GROQ_OTPM_LIMIT__QWEN_QWEN3_8_27B="1000")
+    attempts = []
+
+    def answer(self, request):
+        attempts.append(1)
+        return "{}"
+
+    transport = _stub_groq(generate=answer, model=QWEN,
+                           budget=llm_client.TokenBudget(1_000_000))
+    transport.output_budget = llm_client.output_budget_for(QWEN)
+    with pytest.raises(llm_client.ProviderError) as raised:
+        transport.generate(llm_client.Request("assessment", "p", max_tokens=2600))
+    assert raised.value.category == "bad_request"
+    assert "exceeds the configured OTPM ceiling" in str(raised.value)
+    assert attempts == [], "the request must never be sent"
+
+
+def test_a_rolling_otpm_refusal_is_retried_not_abandoned(monkeypatch, tmp_path):
+    import llm_client
+
+    _otpm_env(monkeypatch, tmp_path, GROQ_OTPM_LIMIT__QWEN_QWEN3_8_27B="1000")
+    waits: list[float] = []
+    monkeypatch.setattr(llm_client.time, "sleep", lambda s: waits.append(s))
+    attempts = []
+
+    def flaky(self, request):
+        attempts.append(len(attempts))
+        if len(attempts) == 1:
+            raise llm_client.ProviderError(
+                "output_rate_limited",
+                "Rate limit reached. Please try again in 2.5s (OTPM)")
+        self.last_output_usage = 300
+        return "{}"
+
+    transport = _stub_groq(generate=flaky, model=QWEN,
+                           budget=llm_client.TokenBudget(1_000_000))
+    transport.output_budget = llm_client.output_budget_for(QWEN)
+    reply = transport.generate(llm_client.Request("assessment", "p" * 100, max_tokens=900))
+    assert reply.text == "{}"
+    assert len(attempts) == 2
+    # The provider's own retry-after was honoured.
+    assert waits == [pytest.approx(2.5)]
+
+
+def test_an_otpm_limit_never_rotates_the_api_key(monkeypatch):
+    """Two keys in one organization share the output ceiling too."""
+    import llm_client
+
+    monkeypatch.setattr(llm_client.time, "sleep", lambda _s: None)
+    seen: list[int] = []
+
+    def refuse(self, request):
+        seen.append(self._key_index)
+        raise llm_client.ProviderError("output_rate_limited", "OTPM limit reached")
+
+    transport = _stub_groq(generate=refuse, model=QWEN)
+    transport.keys = ("k1", "k2")
+    with pytest.raises(llm_client.ProviderError):
+        transport.generate(llm_client.Request("assessment", "p", max_tokens=900))
+    assert set(seen) == {0}, "an output rate limit must not spend the second key"
+    assert transport._key_index == 0
+    assert "output_rate_limited" not in llm_client.KEY_SPECIFIC_CATEGORIES
+
+
+# ---- 5. nothing else moved ------------------------------------------------
+
+def test_the_research_path_is_byte_for_byte_unchanged(run, c3):
+    import llm_client
+
+    request = _captured_audit_requests(run, c3)["company_research"]
+    assert request.max_tokens == 1000
+    assert request.web_search is True
+    assert request.json is False
+    assert request.reasoning_effort == "low"
+    source = Path(llm_client.__file__).read_text(encoding="utf-8")
+    generate = source.split("def _generate(self, request: Request) -> str:")[1]
+    generate = generate.split("\n\n\n")[0]
+    assert 'settings["tool_choice"] = "required"' in generate
+    assert 'settings["tools"] = [{"type": "browser_search"}]' in generate
+
+
+def test_parallelism_and_the_single_writer_are_untouched():
+    source = Path(run_pipeline.__file__).read_text(encoding="utf-8")
+    block = source.split("def run_audits(")[1].split("\ndef ")[0]
+    assert "ThreadPoolExecutor(max_workers=2)" in block
+    assert block.count("pool.submit(") == 2
+    code = _code_only(block)
+    for forbidden in ("write_text", "write_json_atomic", "json.dump"):
+        assert forbidden not in code
+    assert source.count("write_json_atomic(") == 3
+
+
+# ================ AN. ITPM: input tokens per minute is a third ceiling
+#
+# The second live run: Qwen counted 7256 input tokens against a 7000 ITPM
+# limit while the local estimate said 6169. Two defects at once - the
+# assessment prompt was sending the generation corpus twice, and the generic
+# estimator was 18% optimistic for Qwen's tokenizer.
+
+def _itpm_env(monkeypatch, tmp_path, **settings):
+    lines = [f"{k}={v}" for k, v in settings.items()]
+    (tmp_path / ".env").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    monkeypatch.setattr(engine, "PROJECT_ROOT", tmp_path)
+    for name in ("GROQ_ITPM_LIMIT", "GROQ_ITPM_LIMIT__QWEN_QWEN3_8_27B",
+                 "GROQ_ITPM_LIMIT__OPENAI_GPT_OSS_20B"):
+        monkeypatch.delenv(name, raising=False)
+    import llm_client
+
+    llm_client._MODEL_INPUT_BUDGETS.clear()
+
+
+def _assessment_prompt(run, c3, jd_path=None):
+    """The real assessment prompt, captured without a network call."""
+    return _captured_audit_requests(run, c3)["assessment"].prompt
+
+
+# ---- 1. the prompt actually shrank ---------------------------------------
+
+def test_the_assessment_prompt_is_materially_smaller(run, c3):
+    """Measured against the size that was refused live: 31,502 characters."""
+    import llm_client
+
+    prompt = _assessment_prompt(run, c3)
+    assert len(prompt) < 31502 * 0.75, len(prompt)
+    # And the refused request's own input count is no longer reachable.
+    request = _captured_audit_requests(run, c3)["assessment"]
+    honest = llm_client.estimate_input_tokens(request, QWEN, safety=False)
+    assert honest < 7256, honest
+
+
+def test_the_c3_assessment_estimate_is_below_the_safe_ceiling(run, c3, monkeypatch,
+                                                              tmp_path):
+    import llm_client
+
+    _itpm_env(monkeypatch, tmp_path, GROQ_ITPM_LIMIT__QWEN_QWEN3_8_27B="7000")
+    request = _captured_audit_requests(run, c3)["assessment"]
+    adjusted = llm_client.estimate_input_tokens(request, QWEN)
+    assert adjusted <= llm_client.safe_input_ceiling(QWEN), adjusted
+    assert llm_client.safe_input_ceiling(QWEN) == 6300
+
+
+def test_a_large_posting_still_fits_the_itpm_ceiling(run, monkeypatch, tmp_path):
+    """Superhuman has the longest JD; the JD itself is never truncated."""
+    import llm_client
+
+    _itpm_env(monkeypatch, tmp_path, GROQ_ITPM_LIMIT__QWEN_QWEN3_8_27B="7000")
+    master = engine.load_master()
+    jd = engine.read_jd(REDWOOD_JD)
+    big = {"master": master, "jd": jd,
+           "requirements": engine.extract_jd_requirements(jd.text, master)}
+    request = _captured_audit_requests(run, big)["assessment"]
+    honest = llm_client.estimate_input_tokens(request, QWEN, safety=False)
+    assert honest < llm_client.model_itpm_limit(QWEN), honest
+    # The posting is present in full: no silent truncation of the JD.
+    assert jd.text.strip() in request.prompt
+
+
+# ---- 2. no dimension lost, alternatives still visible --------------------
+
+def test_no_assessment_dimension_was_removed(run, c3):
+    prompt = _assessment_prompt(run, c3)
+    for dimension in ("tailoring_quality", "experience_selection", "project_selection",
+                      "project_bullets", "callback_likelihood", "fit_score",
+                      "risk_flags"):
+        assert dimension in prompt, dimension
+    # And the compact report still renders all ten fields from them.
+    audit, problems = grounding.validate_application_audit({
+        "tailoring_quality": {"score": 9.0},
+        "experience_selection": {"score": 8.5},
+        "project_selection": {"score": 8.0, "components": {}},
+        "project_bullets": {"score": 8.0, "components": {}},
+        "callback_likelihood": "HIGH"})
+    assert problems == []
+    assert len(grounding.ASSESSMENT_FIELDS) == 10
+
+
+def test_unselected_projects_keep_enough_to_judge_the_selection(run, c3):
+    prompt = _assessment_prompt(run, c3)
+    master = run["master"]
+    selected = {"lms", "pintos", "temp"}
+    unselected = [p for p in master.projects if p.project_id not in selected]
+    assert unselected, "fixture assumption"
+    for project in unselected:
+        assert project.project_id in prompt, project.project_id
+        # Title and at least one technology, so a better choice is spottable.
+        assert project.name.split("(")[0].strip()[:20] in prompt, project.project_id
+        assert project.tech[0] in prompt, project.project_id
+    assert "NOT SELECTED" in prompt
+
+
+def test_the_full_evidence_corpus_is_no_longer_duplicated(run, c3):
+    """Each selected project's evidence appears once, as a short digest."""
+    prompt = _assessment_prompt(run, c3)
+    master = run["master"]
+    for pid in ("lms", "pintos", "temp"):
+        evidence = master.project(pid).evidence
+        joined = " ".join(evidence)
+        # The complete corpus is NOT sent; a digest of it is.
+        assert joined not in prompt, f"{pid} full evidence was duplicated"
+    assert "evidence digest" in prompt
+    # The bullets - the artifact under review - are still there in full.
+    assert "FINAL BULLETS" in prompt
+    # The requirement table appears once, not as a table plus a verdict block.
+    assert prompt.count("AUTHORITATIVE REQUIREMENTS") == 1
+    assert "MANUAL-REVIEW REQUIREMENTS" not in prompt
+
+
+def test_deterministic_verdicts_remain_available_one_line_each(run, c3):
+    import llm_client
+
+    prompt = _assessment_prompt(run, c3)
+    master = engine.load_master()
+    verdicts = engine.deterministic_assessment(
+        c3["requirements"], master,
+        engine.ResumeEvidence(experience_text="x", project_bullets=(("lms", "y"),),
+                              skills=("Python",)), c3["jd"].text)
+    for bucket, label in llm_client._VERDICT_LABELS.items():
+        for entry in verdicts.get(bucket) or []:
+            identifier = entry["requirement_id"]
+            assert f"{identifier} |" in prompt, identifier
+            line = next(l for l in prompt.splitlines() if l.strip().startswith(identifier))
+            assert f"| {label} |" in line, line
+    # Python's own evidence paragraphs are NOT resent.
+    for entry in verdicts.get("strong_matches") or []:
+        if entry.get("evidence"):
+            assert entry["evidence"] not in prompt
+
+
+# ---- 4/5. configuration and estimation ----------------------------------
+
+def test_qwen_itpm_resolves_to_7000_from_the_environment(monkeypatch, tmp_path):
+    import llm_client
+
+    _itpm_env(monkeypatch, tmp_path, GROQ_ITPM_LIMIT__QWEN_QWEN3_8_27B="7000")
+    assert llm_client.model_itpm_limit(QWEN) == 7000
+    assert llm_client.safe_input_ceiling(QWEN) == 6300
+    # The global fallback applies to a model with no specific setting.
+    monkeypatch.setenv("GROQ_ITPM_LIMIT", "5000")
+    assert llm_client.model_itpm_limit(RESEARCHER) == 5000
+    assert llm_client.model_itpm_limit(QWEN) == 7000, "specific setting must win"
+    # Unset means no input pacing at all.
+    monkeypatch.delenv("GROQ_ITPM_LIMIT", raising=False)
+    monkeypatch.delenv("GROQ_ITPM_LIMIT__QWEN_QWEN3_8_27B", raising=False)
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    assert llm_client.model_itpm_limit(RESEARCHER) == 0
+    assert llm_client.input_budget_for(RESEARCHER) is None
+
+
+def test_qwen_uses_a_conservative_model_specific_input_estimate():
+    import llm_client
+
+    # Calibrated on the live refusal: 31,502 chars were counted as 7,256.
+    request = llm_client.Request("assessment", "x" * 31502, max_tokens=900)
+    honest = llm_client.estimate_input_tokens(request, QWEN, safety=False)
+    assert 7000 <= honest <= 7500, honest
+    adjusted = llm_client.estimate_input_tokens(request, QWEN)
+    assert adjusted > honest, "the safety factor must inflate the reservation"
+    assert adjusted == pytest.approx(honest * 1.25, rel=0.02)
+    assert llm_client.input_safety_factor(QWEN) == 1.25
+    # A model with no calibration keeps the generic assumption.
+    generic = llm_client.estimate_input_tokens(request, "other/model")
+    assert generic < honest
+    assert llm_client.input_safety_factor("other/model") == 1.0
+
+
+def test_input_and_combined_estimates_are_not_conflated():
+    import llm_client
+
+    request = llm_client.Request("assessment", "x" * 12000, max_tokens=900)
+    combined = llm_client.estimate_tokens(request)
+    inputs = llm_client.estimate_input_tokens(request, QWEN, safety=False)
+    # The combined figure includes the reserved output; the input one does not.
+    assert combined == 12000 // 6 + 900
+    assert inputs == int(12000 / 4.3) + 1
+    assert "max_tokens" not in llm_client.estimate_input_tokens.__doc__
+
+
+def test_a_request_over_the_itpm_ceiling_fails_before_the_provider(monkeypatch,
+                                                                   tmp_path):
+    import llm_client
+
+    _itpm_env(monkeypatch, tmp_path, GROQ_ITPM_LIMIT__QWEN_QWEN3_8_27B="7000")
+    sent = []
+
+    def answer(self, request):
+        sent.append(1)
+        return "{}"
+
+    transport = _stub_groq(generate=answer, model=QWEN,
+                           budget=llm_client.TokenBudget(1_000_000))
+    transport.input_budget = llm_client.input_budget_for(QWEN)
+    # Comfortably beyond any ceiling: 60k characters of prompt.
+    with pytest.raises(llm_client.ProviderError) as raised:
+        transport.generate(llm_client.Request("assessment", "x" * 60000, max_tokens=900))
+    assert raised.value.category == "request_too_large"
+    assert "ITPM ceiling" in str(raised.value)
+    assert sent == [], "the request must never reach the provider"
+
+
+def test_the_safety_factor_never_rejects_a_request_that_would_fit(monkeypatch,
+                                                                  tmp_path):
+    """An inflated reservation warns; only the honest figure can refuse."""
+    import llm_client
+
+    _itpm_env(monkeypatch, tmp_path, GROQ_ITPM_LIMIT__QWEN_QWEN3_8_27B="7000")
+    sent = []
+
+    def answer(self, request):
+        sent.append(1)
+        self.last_input_usage = 5600
+        return "{}"
+
+    transport = _stub_groq(generate=answer, model=QWEN,
+                           budget=llm_client.TokenBudget(1_000_000))
+    transport.input_budget = llm_client.input_budget_for(QWEN)
+    # ~27k chars: honest ~6300, adjusted ~7900 (over ITPM), real usage 5600.
+    prompt = "x" * 27000
+    assert llm_client.estimate_input_tokens(
+        llm_client.Request("assessment", prompt), QWEN) > 7000
+    transport.generate(llm_client.Request("assessment", prompt, max_tokens=900))
+    assert sent == [1], "a request that honestly fits must be sent"
+
+
+# ---- 7. rolling input pacing --------------------------------------------
+
+def test_two_rapid_assessments_are_paced_by_the_input_window(monkeypatch, tmp_path):
+    import llm_client
+
+    _itpm_env(monkeypatch, tmp_path, GROQ_ITPM_LIMIT__QWEN_QWEN3_8_27B="7000")
+    state = {"now": 0.0, "slept": []}
+    budget = llm_client.input_budget_for(QWEN)
+    budget._sleep = lambda s: (state["slept"].append(s),
+                               state.__setitem__("now", state["now"] + s))
+    budget._clock = lambda: state["now"]
+
+    calls = []
+
+    def answer(self, request):
+        calls.append(request.purpose)
+        self.last_input_usage = 4800      # two of these exceed 7000/min
+        return "{}"
+
+    transport = _stub_groq(generate=answer, model=QWEN,
+                           budget=llm_client.TokenBudget(1_000_000))
+    transport.input_budget = budget
+    request = lambda: llm_client.Request(            # noqa: E731 - test brevity
+        "assessment", "x" * 20000, max_tokens=900)
+
+    transport.generate(request())
+    assert state["slept"] == [], "the first call has the whole window"
+    transport.generate(request())
+    assert state["slept"], "the second call must wait for the input window"
+    assert sum(state["slept"]) == pytest.approx(60.0)
+    assert calls == ["assessment", "assessment"]
+
+
+def test_actual_prompt_usage_replaces_the_input_reservation(monkeypatch, tmp_path):
+    import llm_client
+
+    _itpm_env(monkeypatch, tmp_path, GROQ_ITPM_LIMIT__QWEN_QWEN3_8_27B="7000")
+    budget = llm_client.input_budget_for(QWEN)
+
+    def answer(self, request):
+        self.last_input_usage = 4200
+        self.last_output_usage = 300
+        self.last_usage = 4500
+        return "{}"
+
+    transport = _stub_groq(generate=answer, model=QWEN,
+                           budget=llm_client.TokenBudget(1_000_000))
+    transport.input_budget = budget
+    transport.generate(llm_client.Request("assessment", "x" * 18000, max_tokens=900))
+    assert [t for _, t in budget.used] == [4200], budget.used
+
+
+def test_qwens_input_budget_cannot_block_gpt_oss(monkeypatch, tmp_path):
+    import llm_client
+
+    _itpm_env(monkeypatch, tmp_path, GROQ_ITPM_LIMIT__QWEN_QWEN3_8_27B="7000",
+              GROQ_ITPM_LIMIT__OPENAI_GPT_OSS_20B="30000")
+    qwen = llm_client.input_budget_for(QWEN)
+    research = llm_client.input_budget_for(RESEARCHER)
+    assert qwen is not research
+    assert research.limit == 30000
+
+    qwen.record(7000)                     # Qwen's whole input minute is spent
+    slept: list[float] = []
+    research._sleep = lambda s: slept.append(s)
+    assert research.wait_for(2000) == 0.0
+    assert slept == [], "research paced on Qwen's input window"
+    # All three budgets for one model are distinct objects.
+    assert len({id(llm_client.budget_for(QWEN)), id(llm_client.output_budget_for(QWEN)),
+                id(qwen)}) == 3
+
+
+def test_an_itpm_refusal_never_rotates_the_api_key(monkeypatch):
+    import llm_client
+
+    monkeypatch.setattr(llm_client.time, "sleep", lambda _s: None)
+    seen: list[int] = []
+
+    def refuse(self, request):
+        seen.append(self._key_index)
+        raise llm_client.ProviderError("input_rate_limited",
+                                       "Limit 7000, Requested 7256 ITPM")
+
+    transport = _stub_groq(generate=refuse, model=QWEN)
+    transport.keys = ("k1", "k2")
+    with pytest.raises(llm_client.ProviderError):
+        transport.generate(llm_client.Request("assessment", "p", max_tokens=900))
+    assert set(seen) == {0}, "an input rate limit must not spend the second key"
+    assert "input_rate_limited" not in llm_client.KEY_SPECIFIC_CATEGORIES
+
+
+def test_itpm_otpm_and_tpm_are_three_separate_classifications():
+    import llm_client
+
+    assert llm_client.classify_http(
+        413, "Limit 7000, Requested 7256 on input tokens per minute (ITPM)"
+    ) == "input_rate_limited"
+    assert llm_client.classify_http(
+        429, "output tokens per minute (OTPM)") == "output_rate_limited"
+    assert llm_client.classify_http(
+        429, "tokens per minute (TPM): Limit 8000") == "rate_limited"
+    assert llm_client.classify_http(
+        429, "tokens per day (TPD)") == "daily_limit_exhausted"
+    assert llm_client.classify_http(413, "Request too large") == "request_too_large"
+    assert llm_client.classify_exception(
+        Exception("ITPM limit reached")) == "input_rate_limited"
+
+
+def test_a_rolling_itpm_refusal_is_retried(monkeypatch, tmp_path):
+    import llm_client
+
+    _itpm_env(monkeypatch, tmp_path, GROQ_ITPM_LIMIT__QWEN_QWEN3_8_27B="7000")
+    waits: list[float] = []
+    monkeypatch.setattr(llm_client.time, "sleep", lambda s: waits.append(s))
+    attempts = []
+
+    def flaky(self, request):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise llm_client.ProviderError(
+                "input_rate_limited", "Rate limit reached. Try again in 4s (ITPM)")
+        self.last_input_usage = 4000
+        return "{}"
+
+    transport = _stub_groq(generate=flaky, model=QWEN,
+                           budget=llm_client.TokenBudget(1_000_000))
+    transport.input_budget = llm_client.input_budget_for(QWEN)
+    reply = transport.generate(llm_client.Request("assessment", "x" * 18000,
+                                                  max_tokens=900))
+    assert reply.text == "{}"
+    assert len(attempts) == 2
+    assert waits == [pytest.approx(4.0)]
+
+
+def test_the_input_preflight_logs_all_four_numbers(monkeypatch, tmp_path, caplog):
+    import logging
+
+    import llm_client
+
+    _itpm_env(monkeypatch, tmp_path, GROQ_ITPM_LIMIT__QWEN_QWEN3_8_27B="7000")
+    transport = _stub_groq(generate=lambda self, r: "{}", model=QWEN,
+                           budget=llm_client.TokenBudget(1_000_000))
+    transport.input_budget = llm_client.input_budget_for(QWEN)
+    transport.log = logging.getLogger("itpm-preflight")
+    with caplog.at_level(logging.INFO, logger="itpm-preflight"):
+        transport.generate(llm_client.Request("assessment", "x" * 18000, max_tokens=900))
+    logged = " ".join(r.getMessage() for r in caplog.records)
+    for field in ("prompt_estimate=", "schema_estimate=",
+                  "adjusted_input_estimate=", "configured_itpm=7000",
+                  "safe_ceiling=6300"):
+        assert field in logged, field
+
+
+# ---- 8. the OTPM fix and the architecture are untouched -----------------
+
+def test_the_otpm_and_completion_settings_are_unchanged(run, c3):
+    import llm_client
+
+    request = _captured_audit_requests(run, c3)["assessment"]
+    assert request.max_tokens == 900
+    # Reasoning is off entirely, so the whole 900 belongs to the document.
+    assert request.reasoning_effort == "none"
+    assert request.reasoning_format is None
+    assert request.include_reasoning is None
+    assert llm_client.AUDIT_OUTPUT_TOKENS["assessment"] == 900
+    assert llm_client.model_otpm_limit(QWEN) == 1000
+    # Ids-only buckets survive, now enforced by the schema itself.
+    assert "requirement_ids and nothing else" in request.prompt
+    buckets = llm_client.APPLICATION_ASSESSMENT_SCHEMA["properties"]
+    for bucket in ("strong_matches", "partial_matches", "gaps", "manual_review"):
+        assert list(buckets[bucket]["items"]["properties"]) == ["requirement_id"]
+
+
+def test_the_research_path_is_still_untouched_by_the_input_work(run, c3):
+    import llm_client
+
+    request = _captured_audit_requests(run, c3)["company_research"]
+    assert request.max_tokens == 1000
+    assert request.web_search is True and request.json is False
+    assert request.reasoning_effort == "low"
+    # Research has no input ceiling configured, so it is never input-paced.
+    assert llm_client.input_budget_for(RESEARCHER) is None or \
+        llm_client.input_budget_for(RESEARCHER) is not llm_client.input_budget_for(QWEN)
+
+
+# ================= AO. strict Structured Outputs for the Qwen assessment
+#
+# The third live run passed ITPM and OTPM and then failed with HTTP 400
+# json_validate_failed: best-effort JSON-object mode could not certify its own
+# output. Groq supports strict JSON Schema for this model, so the shape is now
+# the provider's contract rather than a hope.
+
+def _schema_objects(node, path="root"):
+    """Every object node in the schema, with its path."""
+    found = []
+    if isinstance(node, dict):
+        if node.get("type") == "object":
+            found.append((path, node))
+        for name, child in (node.get("properties") or {}).items():
+            found += _schema_objects(child, f"{path}.{name}")
+        if node.get("type") == "array":
+            found += _schema_objects(node.get("items") or {}, f"{path}[]")
+    return found
+
+
+# ---- 1. the request uses strict structured output -----------------------
+
+def test_the_assessment_request_uses_a_strict_json_schema(run, c3):
+    import llm_client
+
+    request = _captured_audit_requests(run, c3)["assessment"]
+    assert request.response_schema is llm_client.ASSESSMENT_RESPONSE_FORMAT
+    assert request.response_schema["type"] == "json_schema"
+    block = request.response_schema["json_schema"]
+    assert block["strict"] is True
+    assert block["name"] == "application_assessment"
+    assert block["schema"] is llm_client.APPLICATION_ASSESSMENT_SCHEMA
+
+
+def test_the_sdk_sends_the_schema_instead_of_json_object_mode():
+    source = Path(_llm_client().__file__).read_text(encoding="utf-8")
+    generate = source.split("def _generate(self, request: Request) -> str:")[1]
+    generate = generate.split("\n\n\n")[0]
+    assert 'settings["response_format"] = request.response_schema' in generate
+    # json_object mode is the ELSE branch, so the two never go together.
+    assert 'elif request.json:' in generate
+    assert generate.index("request.response_schema") < generate.index("json_object")
+
+
+def test_only_the_assessment_uses_a_response_schema(run, c3):
+    requests = _captured_audit_requests(run, c3)
+    assert requests["assessment"].response_schema is not None
+    assert requests["company_research"].response_schema is None
+    # No generation request may carry one either.
+    source = Path(_llm_client().__file__).read_text(encoding="utf-8")
+    for purpose in ("project_selection", "project_bullets", "bullet_repair",
+                    "cover_letter", "company_research"):
+        head = source.split(f'"{purpose}", ')[1].split("))")[0]
+        assert "response_schema" not in head, purpose
+
+
+# ---- 2. the schema is strict-mode legal and matches the contract --------
+
+def test_every_schema_object_forbids_additional_properties():
+    import llm_client
+
+    objects = _schema_objects(llm_client.APPLICATION_ASSESSMENT_SCHEMA)
+    assert len(objects) >= 8, "the schema should have several nested objects"
+    for path, node in objects:
+        assert node.get("additionalProperties") is False, path
+
+
+def test_every_schema_property_is_required():
+    import llm_client
+
+    for path, node in _schema_objects(llm_client.APPLICATION_ASSESSMENT_SCHEMA):
+        properties = set(node.get("properties") or {})
+        assert set(node.get("required") or []) == properties, path
+        assert properties, path
+
+
+def test_the_schema_carries_every_current_assessment_dimension():
+    import llm_client
+
+    properties = llm_client.APPLICATION_ASSESSMENT_SCHEMA["properties"]
+    for field in ("fit_score", "recommendation", "summary", "eligibility",
+                  "strong_matches", "partial_matches", "gaps", "manual_review",
+                  "complementary_strengths", "tailoring_quality",
+                  "experience_selection", "project_selection", "project_bullets",
+                  "callback_likelihood", "risk_flags"):
+        assert field in properties, field
+    assert len(properties) == 15, sorted(properties)
+
+
+def test_the_schema_keeps_every_score_component():
+    import llm_client
+
+    properties = llm_client.APPLICATION_ASSESSMENT_SCHEMA["properties"]
+    selection = properties["project_selection"]["properties"]["components"]["properties"]
+    assert set(selection) == set(grounding.PROJECT_SELECTION_COMPONENTS)
+    bullets = properties["project_bullets"]["properties"]["components"]["properties"]
+    assert set(bullets) == set(grounding.PROJECT_BULLET_COMPONENTS)
+    for block in ("tailoring_quality", "experience_selection", "project_selection",
+                  "project_bullets"):
+        assert properties[block]["properties"]["score"]["type"] == "number", block
+
+
+def test_the_schema_keeps_the_verdict_buckets_ids_only():
+    import llm_client
+
+    properties = llm_client.APPLICATION_ASSESSMENT_SCHEMA["properties"]
+    for bucket in ("strong_matches", "partial_matches", "gaps", "manual_review"):
+        node = properties[bucket]
+        assert node["type"] == "array", bucket
+        item = node["items"]
+        assert list(item["properties"]) == ["requirement_id"], bucket
+        assert item["properties"]["requirement_id"]["type"] == "string", bucket
+        # No evidence prose may creep back in.
+        for prose in ("evidence", "limitation", "detail", "reason", "source",
+                      "importance", "status"):
+            assert prose not in item["properties"], f"{bucket}.{prose}"
+
+
+def test_the_schema_uses_the_existing_enum_contracts():
+    import llm_client
+
+    properties = llm_client.APPLICATION_ASSESSMENT_SCHEMA["properties"]
+    assert properties["recommendation"]["enum"] == list(grounding.RECOMMENDATIONS)
+    assert properties["callback_likelihood"]["enum"] == list(grounding.CALLBACK_LIKELIHOOD)
+    assert properties["eligibility"]["properties"]["status"]["enum"] == \
+        list(grounding.ELIGIBILITY_STATUS)
+
+
+def test_a_schema_shaped_reply_passes_python_validation_unchanged():
+    """Whatever the schema certifies must still satisfy our own validators."""
+    import llm_client
+
+    ids = {f"REQ-{i:03d}" for i in range(1, 6)}
+    reply = {
+        "fit_score": 7.4, "recommendation": "apply",
+        "summary": "Most scored requirements are evidenced.",
+        "eligibility": {"status": "uncertain", "details": []},
+        "strong_matches": [{"requirement_id": "REQ-001"}],
+        "partial_matches": [{"requirement_id": "REQ-002"}],
+        "gaps": [{"requirement_id": "REQ-003"}],
+        "manual_review": [{"requirement_id": "REQ-004"}],
+        "complementary_strengths": [], "risk_flags": [],
+        "tailoring_quality": {"score": 9.0, "notes": []},
+        "experience_selection": {"score": 8.5, "notes": []},
+        "project_selection": {"score": 8.5, "notes": [], "components": {
+            name: 8.0 for name in grounding.PROJECT_SELECTION_COMPONENTS}},
+        "project_bullets": {"score": 8.6, "notes": [], "components": {
+            name: 9.0 for name in grounding.PROJECT_BULLET_COMPONENTS}},
+        "callback_likelihood": "MEDIUM",
+    }
+    # Shape matches the schema's own required/properties sets exactly.
+    assert set(reply) == set(llm_client.APPLICATION_ASSESSMENT_SCHEMA["required"])
+    assert grounding.errors(grounding.validate_assessment(reply, "A posting.", ids)) == []
+    audit, problems = grounding.validate_application_audit(reply)
+    assert problems == []
+    for key in ("experience_selection_score", "resume_tailoring_score",
+                "project_selection_score", "project_bullet_score"):
+        assert audit[key] is not None, key
+    assert audit["callback_likelihood"] == "MEDIUM"
+
+
+# ---- 6. the schema is counted as input ----------------------------------
+
+def test_the_input_estimate_includes_the_schema(run, c3):
+    import llm_client
+
+    request = _captured_audit_requests(run, c3)["assessment"]
+    with_schema = llm_client.estimate_input_tokens(request, QWEN, safety=False)
+    bare = llm_client.Request("assessment", request.prompt, max_tokens=900)
+    without = llm_client.estimate_input_tokens(bare, QWEN, safety=False)
+    assert with_schema > without, "the schema must not be counted as free"
+    # The difference is the serialized schema, at the calibrated rate.
+    serialized = len(json.dumps(request.response_schema, separators=(",", ":")))
+    assert with_schema - without == pytest.approx(serialized / 4.3, abs=2)
+    assert "response_format" in llm_client.request_input_text.__doc__
+
+
+def test_c3_stays_under_the_hard_itpm_ceiling_with_the_schema(run, c3, monkeypatch,
+                                                              tmp_path):
+    import llm_client
+
+    _itpm_env(monkeypatch, tmp_path, GROQ_ITPM_LIMIT__QWEN_QWEN3_8_27B="7000")
+    request = _captured_audit_requests(run, c3)["assessment"]
+    honest = llm_client.estimate_input_tokens(request, QWEN, safety=False)
+    adjusted = llm_client.estimate_input_tokens(request, QWEN)
+    assert honest < 7000, honest
+    assert adjusted < 7000, adjusted
+    # The live refusal was at 7256 provider-counted input tokens.
+    assert honest < 7256
+
+
+def test_the_calibration_and_limits_are_unchanged():
+    import llm_client
+
+    assert llm_client.input_chars_per_token(QWEN) == 4.3
+    assert llm_client.input_safety_factor(QWEN) == 1.25
+    assert llm_client.model_itpm_limit(QWEN) == 7000
+    assert llm_client.safe_input_ceiling(QWEN) == 6300
+    assert llm_client.model_otpm_limit(QWEN) == 1000
+    assert llm_client.AUDIT_OUTPUT_TOKENS["assessment"] == 900
+
+
+# ---- 8. nothing else moved ----------------------------------------------
+
+def test_the_research_response_path_is_unchanged(run, c3):
+    import llm_client
+
+    request = _captured_audit_requests(run, c3)["company_research"]
+    assert request.response_schema is None, "research keeps textual JSON"
+    assert request.json is False
+    assert request.web_search is True
+    assert request.max_tokens == 1000
+    assert request.reasoning_effort == "low"
+    assert request.include_reasoning is False
+    assert "Return ONLY valid JSON" in request.prompt, "its parser needs the ask"
+    # And it still goes through parse_json plus the deterministic validator.
+    source = Path(llm_client.__file__).read_text(encoding="utf-8")
+    research = source.split("def research_company(")[1].split("\n    def ")[0]
+    assert 'parse_json(reply.text, "company_research")' in research
+    assert "grounding.validate_company_research(" in research
+
+
+def test_the_architecture_is_untouched_by_the_schema_work():
+    source = Path(run_pipeline.__file__).read_text(encoding="utf-8")
+    block = source.split("def run_audits(")[1].split("\ndef ")[0]
+    assert "ThreadPoolExecutor(max_workers=2)" in block
+    assert block.count("pool.submit(") == 2
+    code = _code_only(block)
+    for forbidden in ("write_text", "write_json_atomic", "json.dump"):
+        assert forbidden not in code
+    assert source.count("write_json_atomic(") == 3
+    # Neither audit may reach Gemini.
+    client_source = Path(_llm_client().__file__).read_text(encoding="utf-8")
+    builder = client_source.split("def build_client(")[1]
+    assert builder.count("fallback=None") == 2
+
+
+# ============ AP. truncation is not a schema rejection
+#
+# The fourth live run: the strict schema was ACCEPTED, reasoning_format was
+# ACCEPTED, both preflights passed, and generation then ran out of completion
+# budget mid-document. Groq reports that as a validation failure, which the
+# previous classifier read as schema_rejected - sending the reader after the
+# wrong bug entirely.
+
+@pytest.mark.parametrize("body", [
+    "max completion tokens reached before generating a valid document",
+    "the output was truncated to fit max_completion_tokens",
+    "json_validate_failed: missing required content, increase max_completion_tokens",
+    "Generation stopped: finish_reason=length",
+])
+def test_a_truncated_document_classifies_as_output_truncated(body):
+    import llm_client
+
+    assert llm_client.classify_http(400, body) == "output_truncated", body
+    assert llm_client.classify_exception(Exception(body)) == "output_truncated", body
+
+
+@pytest.mark.parametrize("body", [
+    "invalid json_schema: unsupported keyword 'patternProperties'",
+    "json_schema configuration error: strict mode requires additionalProperties false",
+    "Failed to validate JSON. Please adjust your prompt.",
+    "response_format.json_schema is invalid",
+])
+def test_a_real_schema_problem_still_classifies_as_schema_rejected(body):
+    import llm_client
+
+    assert llm_client.classify_http(400, body) == "schema_rejected", body
+
+
+def test_truncation_outranks_the_schema_check():
+    """A message carrying BOTH signals is a truncation, not a schema bug."""
+    import llm_client
+
+    both = ("json_validate_failed: max completion tokens reached before "
+            "generating a valid document")
+    assert llm_client.classify_http(400, both) == "output_truncated"
+    # Order matters in the classifier, so assert the precedence explicitly.
+    source = Path(llm_client.__file__).read_text(encoding="utf-8")
+    block = _code_only(
+        source.split("if status == 400:")[1].split("if status >= 500:")[0])
+    assert block.index("_TRUNCATED_OUTPUT") < block.index("json_validate_failed")
+
+
+@pytest.mark.parametrize("category", ["output_truncated", "schema_rejected"])
+def test_both_categories_are_non_retryable_and_never_rotate_keys(category, monkeypatch):
+    import llm_client
+
+    monkeypatch.setattr(llm_client.time, "sleep", lambda _s: None)
+    assert category in llm_client.NON_RETRYABLE_CATEGORIES
+    assert category not in llm_client.KEY_SPECIFIC_CATEGORIES
+
+    seen: list[int] = []
+
+    def fail(self, request):
+        seen.append(self._key_index)
+        raise llm_client.ProviderError(category, f"simulated {category}")
+
+    transport = _stub_groq(generate=fail, model=QWEN)
+    transport.keys = ("k1", "k2")
+    with pytest.raises(llm_client.ProviderError) as raised:
+        transport.generate(llm_client.Request("assessment", "p", max_tokens=900))
+    assert seen == [0], "identical bytes must not be resent, on any key"
+    assert raised.value.category == category
+    assert transport._key_index == 0
+
+
+def test_a_truncated_completion_keeps_its_output_reservation(monkeypatch, tmp_path):
+    """Truncated tokens were really generated, so the window must hold them."""
+    import llm_client
+
+    _otpm_env(monkeypatch, tmp_path, GROQ_OTPM_LIMIT__QWEN_QWEN3_8_27B="1000")
+    budget = llm_client.output_budget_for(QWEN)
+
+    def truncate(self, request):
+        self.last_output_usage = 900      # the whole cap was spent
+        raise llm_client.ProviderError("output_truncated",
+                                       "max completion tokens reached")
+
+    transport = _stub_groq(generate=truncate, model=QWEN,
+                           budget=llm_client.TokenBudget(1_000_000))
+    transport.output_budget = budget
+    with pytest.raises(llm_client.ProviderError):
+        transport.generate(llm_client.Request("assessment", "p" * 3000, max_tokens=900))
+    assert [t for _, t in budget.used] == [900], budget.used
+
+
+# ---- the rest of the contract is untouched ------------------------------
+
+def test_the_completion_cap_and_otpm_are_unchanged():
+    import llm_client
+
+    assert llm_client.AUDIT_OUTPUT_TOKENS["assessment"] == 900
+    assert llm_client.AUDIT_OUTPUT_TOKENS["company_research"] == 1000
+    assert llm_client.model_otpm_limit(QWEN) == 1000
+    assert llm_client.model_itpm_limit(QWEN) == 7000
+    assert llm_client.safe_input_ceiling(QWEN) == 6300
+
+
+def test_strict_structured_output_is_still_enabled(run, c3):
+    import llm_client
+
+    request = _captured_audit_requests(run, c3)["assessment"]
+    assert request.response_schema["type"] == "json_schema"
+    assert request.response_schema["json_schema"]["strict"] is True
+    assert request.response_schema["json_schema"]["schema"] is \
+        llm_client.APPLICATION_ASSESSMENT_SCHEMA
+    assert len(llm_client.APPLICATION_ASSESSMENT_SCHEMA["properties"]) == 15
+    # No retreat to json_object mode and no loosening.
+    source = Path(llm_client.__file__).read_text(encoding="utf-8")
+    assert '"strict": True' in source
+    assert "strict=False" not in source and '"strict": False' not in source
+
+
+def test_the_research_reasoning_configuration_is_unchanged(run, c3):
+    request = _captured_audit_requests(run, c3)["company_research"]
+    assert request.reasoning_effort == "low"
+    assert request.include_reasoning is False
+    assert request.reasoning_format is None
+    assert request.response_schema is None
+    assert request.json is False
+    assert request.web_search is True
+    assert request.max_tokens == 1000

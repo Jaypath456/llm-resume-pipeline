@@ -21,6 +21,7 @@ repaired to turn needs_review into success.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import json
 import logging
@@ -38,8 +39,12 @@ import pdf_utils as pdf
 import resume_engine as engine
 
 RESUME_STEM = "resume"
-REQUIRED_ARTIFACTS = ("run.log", "strategy.json", "resume.tex", "resume.pdf",
-                      "resume.txt", "cover_letter.txt", "assessment.json")
+REQUIRED_ARTIFACTS = ("run.log", "strategy.json", "resume.tex",
+                      "resume.txt", "cover_letter.txt", "assessment.txt")
+# Removed after successful verification; kept for diagnosis on a failure.
+LATEX_BUILD_ARTIFACTS = ("resume.aux", "resume.log", "resume.out")
+# No longer produced; removed if an earlier run of a reused folder left one.
+STALE_ARTIFACTS = ("assessment.json",)
 CSV_COLUMNS = ["company_name", "job_title", "job_id", "applied_at_date"]
 
 # Drafting heuristic only. The rendered PDF decides whether a bullet fits;
@@ -286,11 +291,242 @@ class RunResult:
     run_dir: Path | None = None
     issues: list[str] = field(default_factory=list)
     strategy: dict = field(default_factory=dict)
+    assessment: dict = field(default_factory=dict)
+    pdf_path: Path | None = None
 
 
 def sanitize(value: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9]+", "_", (value or "").strip()).strip("_")
     return cleaned[:60] or "Unknown"
+
+
+def final_pdf_name(jd: engine.JobPosting) -> str:
+    """<Company>_<Job_Title>.pdf. No date: the run directory already carries one."""
+    parts = [sanitize(jd.company_name or "Unknown_Company"),
+             sanitize(jd.job_title or "Unknown_Role")]
+    return "_".join(parts) + ".pdf"
+
+
+def finalize_artifacts(run_dir: Path, jd: engine.JobPosting, log: StageLog) -> Path | None:
+    """Rename the verified PDF and remove LaTeX build junk.
+
+    Only ever called after verification succeeds, so a failed run keeps
+    resume.pdf plus its .aux/.log/.out for diagnosis.
+    """
+    source = run_dir / f"{RESUME_STEM}.pdf"
+    target = run_dir / final_pdf_name(jd)
+    renamed: Path | None = None
+    if source.exists():
+        if target.exists() and target != source:
+            target.unlink()
+        source.replace(target)
+        renamed = target
+        log.info("final resume PDF: %s", target.name)
+    elif target.exists():
+        renamed = target
+    for name in LATEX_BUILD_ARTIFACTS + STALE_ARTIFACTS:
+        junk = run_dir / name
+        if junk.exists():
+            junk.unlink()
+    log.info("removed LaTeX build artifacts: %s", ", ".join(LATEX_BUILD_ARTIFACTS))
+    return renamed
+
+
+def write_json_atomic(path: Path, payload: dict) -> None:
+    """Write JSON so the file is either the old content or the new, never half.
+
+    Same-directory temp file, flushed and fsynced, then os.replace(), which is
+    atomic within a filesystem. The temp name carries the pid so two processes
+    cannot collide on it. A failure part-way through leaves the previous valid
+    file in place and removes the temp.
+    """
+    temp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        with temp.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+    except BaseException:
+        temp.unlink(missing_ok=True)
+        raise
+
+
+# ================================================== post-run Groq audit layer
+#
+# Three Groq calls run AFTER the resume and cover letter are final. They are
+# advisory: their results reach assessment.txt, strategy.json and the terminal
+# and nothing else. No audit value is ever read back into generation, and each
+# call is isolated so one failure cannot blank the other two.
+
+
+def project_catalogue(master: engine.MasterFacts, selection, chosen: list,
+                      bullets: dict[str, list[str]]) -> list[dict]:
+    """EVERY candidate project, not only the three that shipped.
+
+    Project selection cannot be audited from the selected three alone, so the
+    whole catalogue goes to the audit with its ranking and rationale.
+    """
+    selected_ids = list(getattr(selection, "selected", []) or [])
+    ranks = getattr(selection, "ranks", {}) or {}
+    reasons = getattr(selection, "reasons", {}) or {}
+    catalogue: list[dict] = []
+    for project in master.projects:
+        pid = project.project_id
+        catalogue.append({
+            "project_id": pid,
+            "name": project.name,
+            "tech": list(project.tech),
+            "tags": list(getattr(project, "tags", ()) or ()),
+            "evidence": " | ".join(project.evidence),
+            "selected": pid in selected_ids,
+            "llm_rank": ranks.get(pid),
+            "reason": reasons.get(pid, ""),
+            "final_bullets": list(bullets.get(pid, [])),
+        })
+    return catalogue
+
+
+def run_audits(client, jd: engine.JobPosting, signals, decision, *, policy, master,
+               selection, chosen, project_bullets: dict[str, list[str]],
+               display_order: list[str], allocation: dict[str, int],
+               skills: list[str], experience_plain: list[str],
+               requirements: list, tailoring: dict, extra_experience: list[str],
+               log: StageLog, experience_context: dict | None = None) -> dict:
+    """The two Groq audits, run CONCURRENTLY. Never raises.
+
+    SINGLE WRITER by construction. Each worker is a pure function of its
+    inputs: it performs the network call, normalizes the reply and RETURNS a
+    result object. No worker touches strategy.json, assessment.txt, tracking
+    or any other artifact - this coordinator collects both futures, merges
+    them in a fixed order and hands one dict back for the caller to persist
+    exactly once.
+
+    The two calls are independent and hit different Groq models with separate
+    pacing budgets, so one failing or stalling cannot cancel or delay the
+    other.
+    """
+    catalogue = project_catalogue(master, selection, chosen, project_bullets)
+    selection_detail = {
+        "selected": list(getattr(selection, "selected", []) or []),
+        "display_order": list(display_order or []),
+        "allocation": dict(allocation or {}),
+    }
+    # Read-only inputs for the workers. Copies, so a worker cannot mutate
+    # anything the coordinator or the caller still relies on.
+    context_copy = dict(experience_context or {})
+    catalogue_copy = [dict(entry) for entry in catalogue]
+    detail_copy = dict(selection_detail)
+    bullets_copy = {pid: list(values) for pid, values in (project_bullets or {}).items()}
+
+    def application_worker() -> dict:
+        """Worker 1: Qwen. Returns a result object; writes nothing."""
+        return client.assess(
+            jd, signals, chosen, list(skills), experience_plain=list(experience_plain),
+            project_bullets=bullets_copy, requirements=requirements,
+            tailoring=dict(tailoring or {}), extra_experience=list(extra_experience or []),
+            project_catalogue=catalogue_copy, selection_detail=detail_copy,
+            experience_context=context_copy)
+
+    def research_worker() -> dict:
+        """Worker 2: GPT-OSS with browser search. Returns a result object."""
+        return client.research_company(
+            jd, jd_posted=grounding.job_posted_date(jd.text),
+            today=date.today().isoformat())
+
+    out: dict = {"application_audit": {}, "assessment": {}, "research": {},
+                 "errors": {}, "catalogue": catalogue, "selection_detail": selection_detail,
+                 "experience_context": context_copy}
+
+    audit_log = log.stage_log("APPLICATION AUDIT")
+    research_log = log.stage_log("COMPANY RESEARCH")
+    log.info("launching the assessment and company-research audits in parallel "
+             "(max_workers=2); neither worker writes any artifact")
+    # Both futures are SUBMITTED before either result is awaited, which is what
+    # makes this parallel rather than two sequential calls.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        futures = {
+            "application_audit": pool.submit(application_worker),
+            "company_research": pool.submit(research_worker),
+        }
+        results: dict[str, object] = {}
+        errors: dict[str, str] = {}
+        # Fixed collection order, so output is deterministic no matter which
+        # future finishes first.
+        for name in ("application_audit", "company_research"):
+            try:
+                results[name] = futures[name].result()
+            except llm_client.ProviderError as error:
+                errors[name] = f"{error.category}: {error}"
+            except Exception as error:               # noqa: BLE001 - advisory
+                errors[name] = f"{type(error).__name__}: {error}"
+
+    # ---- merge, in the coordinator thread only ---------------------------
+    if "application_audit" in results:
+        assessment = results["application_audit"] or {}
+        out["assessment"] = assessment
+        out["application_audit"] = assessment.get("application_audit") or {}
+        block = out["application_audit"]
+        audit_log.info("experience_selection=%s resume_tailoring=%s project_selection=%s "
+                       "project_bullets=%s callback_likelihood=%s",
+                       block.get("experience_selection_score"),
+                       block.get("resume_tailoring_score"),
+                       block.get("project_selection_score"),
+                       block.get("project_bullet_score"),
+                       block.get("callback_likelihood"))
+        for name, value in (block.get("project_selection_components") or {}).items():
+            audit_log.info("project selection component %s=%s", name, value)
+        for name, value in (block.get("project_bullet_components") or {}).items():
+            audit_log.info("project bullet component %s=%s", name, value)
+        for note in (block.get("experience_selection_notes") or []):
+            audit_log.info("experience selection note: %s", note)
+        for note in (block.get("project_selection_notes") or []):
+            audit_log.info("project selection note: %s", note)
+        for note in (block.get("project_bullet_notes") or []):
+            audit_log.info("project bullet note: %s", note)
+        audit_log.info("ADVISORY ONLY: the shipped Experience ids are unchanged (%s)",
+                       ", ".join(decision.shipped_ids))
+    else:
+        out["errors"]["application_audit"] = errors["application_audit"]
+        audit_log.warning("application audit unavailable: %s",
+                          errors["application_audit"])
+
+    if "company_research" in results:
+        research = results["company_research"] or {}
+        out["research"] = research
+        research_log.info("visa=%s (%s) stem_opt=%s (%s) job_posted=%s (%s)",
+                          research.get("company_visa_sponsorship"),
+                          research.get("company_visa_confidence"),
+                          research.get("company_stem_opt_support"),
+                          research.get("company_stem_opt_confidence"),
+                          research.get("job_posted"),
+                          research.get("job_posted_confidence"))
+        research_log.info("checked_at=%s sources=%d",
+                          research.get("checked_at") or "unknown",
+                          len(research.get("sources") or []))
+        for source in research.get("sources") or []:
+            research_log.info("source: [%s] %s %s", source.get("scope", "unscoped"),
+                              source.get("title"), source.get("url"))
+    else:
+        out["errors"]["company_research"] = errors["company_research"]
+        research_log.warning("company research unavailable: %s",
+                             errors["company_research"])
+    return out
+
+
+def assessment_report(audits: dict, letter_score) -> dict:
+    """The ten user-facing fields, from whichever audits succeeded."""
+    return grounding.audit_report(
+        application_audit=audits.get("application_audit"),
+        research=audits.get("research"),
+        letter_score=letter_score)
+
+
+def print_assessment(report: dict, *, company: str, job_title: str) -> None:
+    """The compact block printed after every completed job."""
+    for line in grounding.render_assessment_terminal(
+            report, company=company, job_title=job_title):
+        print(line)
 
 
 def run_folder_for(jd: engine.JobPosting, *, isolated: bool,
@@ -645,23 +881,6 @@ def run_one(jd_path: Path, *, mock: bool, smoke: bool, console: bool = True) -> 
         order_log.info("decision: %s -> %s", signals.section_mode, " -> ".join(order))
         order_log.info("Python owns this decision; no model input is consulted")
 
-        # ---- experience (deterministic, protected) ----------------------
-        exp_log = log.stage_log("EXPERIENCE")
-        decision = engine.select_experience(template, policy, signals)
-        exp_log.info("rule applied: %s", decision.rule)
-        for bullet_id, action, latex in decision.shipped:
-            if action == "SWAP":
-                swap = next(s for s in decision.swaps if s[0] == bullet_id)
-                exp_log.info("%s action=SWAP target_id=%s rule=%r text=%r",
-                             bullet_id, swap[1], swap[2], engine.latex_to_plain(latex))
-            else:
-                exp_log.info("%s action=KEEP_EXACT text=%r",
-                             bullet_id, engine.latex_to_plain(latex))
-        exp_log.info("shipped ids: %s", ", ".join(decision.shipped_ids))
-        exp_log.info("wording comes from %s, never from the template; no model has authority "
-                     "over this section (%d approved variants exist)",
-                     engine.POLICY_PATH.name, len(decision.allowed_plain))
-
         client = llm_client.build_client(master, policy, log.stage_log("PROVIDER"),
                                         mock=mock, credentials=credentials)
 
@@ -691,6 +910,54 @@ def run_one(jd_path: Path, *, mock: bool, smoke: bool, console: bool = True) -> 
                            selection.ranks[pid])
         order_log.info("chronology decides display only; it never influenced which three "
                        "projects were selected or how many bullets each earned")
+
+
+        # ---- semantic JD signals (Gemini recall, Python decides) --------
+        sem_log = log.stage_log("JD SIGNALS")
+        deterministic_map = grounding.deterministic_signal_map(signals)
+        validated_signals, signal_problems = grounding.validate_semantic_signals(
+            selection.semantic_signals_raw, jd.text)
+        for problem in signal_problems:
+            sem_log.warning("%s", problem.message)
+        merged_map, signal_overrides = grounding.merge_semantic_signals(
+            signals, validated_signals)
+        for name, value in sorted(deterministic_map.items()):
+            sem_log.info("deterministic %s=%s | gemini=%s | merged=%s", name,
+                         value, validated_signals.get(name, "not reported"),
+                         merged_map.get(name))
+        if signal_overrides["added"]:
+            sem_log.info("Gemini recovered %d signal(s) the deterministic classifier "
+                         "missed: %s", len(signal_overrides["added"]),
+                         ", ".join(signal_overrides["added"]))
+        else:
+            sem_log.info("no semantic signal was added; the deterministic view stands")
+        merged_signals = grounding.apply_semantic_overrides(signals, signal_overrides)
+        sem_log.info("Gemini reads the posting; it never selects an Experience bullet, "
+                     "proposes one, or writes any Experience wording")
+
+        # ---- experience (deterministic, protected) ----------------------
+        exp_log = log.stage_log("EXPERIENCE")
+        # MERGED signals feed the existing deterministic policy. Nothing else
+        # in the run uses them, so project selection, bullets, skills, order
+        # and verification are all byte-identical to the deterministic path.
+        decision = engine.select_experience(template, policy, merged_signals)
+        exp_log.info("rule applied: %s", decision.rule)
+        if merged_signals is not signals:
+            exp_log.info("the rule was resolved from MERGED signals (deterministic plus "
+                         "%s recovered by validated Gemini evidence)",
+                         ", ".join(signal_overrides["added"]))
+        for bullet_id, action, latex in decision.shipped:
+            if action == "SWAP":
+                swap = next(s for s in decision.swaps if s[0] == bullet_id)
+                exp_log.info("%s action=SWAP target_id=%s rule=%r text=%r",
+                             bullet_id, swap[1], swap[2], engine.latex_to_plain(latex))
+            else:
+                exp_log.info("%s action=KEEP_EXACT text=%r",
+                             bullet_id, engine.latex_to_plain(latex))
+        exp_log.info("shipped ids: %s", ", ".join(decision.shipped_ids))
+        exp_log.info("wording comes from %s, never from the template; no model has authority "
+                     "over this section (%d approved variants exist)",
+                     engine.POLICY_PATH.name, len(decision.allowed_plain))
 
         # ---- project bullets (LLM, grounded) ----------------------------
         write_log = log.stage_log("PROJECT WRITING")
@@ -767,11 +1034,51 @@ def run_one(jd_path: Path, *, mock: bool, smoke: bool, console: bool = True) -> 
         # ---- cover letter ------------------------------------------------
         letter_log = log.stage_log("COVER LETTER")
         letter_problems: list[grounding.Problem] = []
+        letter_priorities: list[dict] = []
+        letter_sources: list[str] = []
         letter = ""
         try:
+            # Deterministic authority for what the letter may claim: evaluate
+            # every JD-named concept against the resume that is actually being
+            # sent, and forbid candidate-owned phrasing for the unsupported ones.
+            letter_evidence = engine.ResumeEvidence(
+                experience_text=" ".join(engine.latex_to_plain(l)
+                                         for _, _, l in decision.shipped),
+                project_bullets=tuple((r.project.project_id, " ".join(r.bullets))
+                                      for r in renders),
+                skills=tuple(state.all_skills()))
+            unsupported_concepts = engine.unsupported_jd_concepts(
+                requirements, master, letter_evidence)
+            if unsupported_concepts:
+                letter_log.info("JD concepts the resume does not support (never claimable "
+                                "as experience): %s", ", ".join(unsupported_concepts))
+            # Evidence grouped by source, so a paragraph cannot silently move
+            # facts between one role or project and another.
+            letter_capsules = engine.source_capsules(master, chosen)
+            # WHICH supported evidence the letter should lead with. Read-only
+            # over the requirements and capsules built above: it changes no
+            # resume decision and authorizes no new claim.
+            letter_priorities = grounding.letter_priorities(
+                jd_text=jd.text, job_title=jd.job_title or "", requirements=requirements,
+                capsules=letter_capsules, master=master,
+                on_resume=[p.project_id for p in chosen])
+            for index, priority in enumerate(letter_priorities, start=1):
+                if priority["supported"]:
+                    letter_log.info("distinctive priority %d: %s (weight=%d) -> %s (%s)",
+                                    index, priority["label"], priority["weight"],
+                                    priority["source_name"],
+                                    ", ".join(priority["evidence_terms"]))
+                else:
+                    letter_log.info("distinctive priority %d: %s (weight=%d) -> no supported "
+                                    "evidence, leaving it uncovered", index,
+                                    priority["label"], priority["weight"])
+            if not letter_priorities:
+                letter_log.info("no distinctive priorities: this posting reads as a generic "
+                                "software-engineering role")
             letter, letter_problems = client.cover_letter(
                 jd, signals, [engine.latex_to_plain(l) for _, _, l in decision.shipped],
-                chosen, themes=themes)
+                chosen, themes=themes, unsupported=unsupported_concepts,
+                capsules=letter_capsules, priorities=letter_priorities)
             (run_dir / "cover_letter.txt").write_text(letter, encoding="utf-8")
             provider = next((c.provider for c in reversed(client.calls)
                              if c.purpose == "cover_letter"), "unknown")
@@ -798,7 +1105,13 @@ def run_one(jd_path: Path, *, mock: bool, smoke: bool, console: bool = True) -> 
             if missing_terms:
                 letter_log.info("named terms not mentioned (acceptable, depth over "
                                 "keywords): %s", ", ".join(missing_terms))
+            letter_sources = sources
             letter_log.info("evidence sources=%s", ", ".join(sources) or "none detected")
+            for priority in grounding.supported_priorities(letter_priorities):
+                letter_log.info("priority %r addressed=%s own_evidence=%s",
+                                priority["label"],
+                                grounding.priority_addressed(letter, priority),
+                                grounding.priority_uses_own_source(letter, priority))
             for entry in grounding.classify_letter_metrics(
                     letter, master, jd_text=jd.text, company=jd.company_name,
                     masked_terms=(jd.job_id,) if jd.job_id else ()):
@@ -829,24 +1142,42 @@ def run_one(jd_path: Path, *, mock: bool, smoke: bool, console: bool = True) -> 
         # Bound before the try: the issues list references it even when assess()
         # raises, exactly like known_ids above.
         final_problems: list[grounding.Problem] = []
-        try:
-            tailoring_signals = {
-                "skills_rendered_lines": verification.skills_rendered_lines,
-                "experience_exact": verification.experience_exact,
-                "pages": verification.pages,
-                "projects": ", ".join(selection.selected),
-                "issues": verification.issues,
-            }
-            assessment = client.assess(
-                jd, signals, chosen, state.all_skills(),
-                experience_plain=[engine.latex_to_plain(l) for _, _, l in decision.shipped],
+        tailoring_signals = {
+            "skills_rendered_lines": verification.skills_rendered_lines,
+            "experience_exact": verification.experience_exact,
+            "pages": verification.pages,
+            "projects": ", ".join(selection.selected),
+            "issues": verification.issues,
+        }
+        # THE POST-RUN AUDIT LAYER. The resume and cover letter are final and
+        # verified before this line; every value below is advisory. run_audits
+        # never raises and isolates each call, so a failed audit leaves the
+        # other two intact.
+        audits = run_audits(
+                client, jd, signals, decision, policy=policy, master=master,
+                selection=selection, chosen=chosen,
                 project_bullets={r.project.project_id: list(r.bullets) for r in renders},
+                display_order=display, allocation=allocation,
+                skills=state.all_skills(),
+                experience_plain=[engine.latex_to_plain(l) for _, _, l in decision.shipped],
                 requirements=requirements, tailoring=tailoring_signals,
                 extra_experience=(
                     [engine.latex_to_plain(entry.latex)
                      for entry in policy.experience_library if entry.is_role_header]
                     + [engine.latex_to_plain(" ".join(
-                        template.blocks["Education"].split()))]))
+                        template.blocks["Education"].split()))]),
+                log=log,
+                experience_context={
+                    "merged_signals": merged_map,
+                    "rule": decision.rule,
+                    "swaps": [(source, target) for source, target, _ in decision.swaps],
+                    "shipped_ids": list(decision.shipped_ids),
+                })
+        assessment = audits["assessment"]
+        assessment_error = audits["errors"].get("application_audit", "")
+        try:
+            if assessment_error:
+                raise llm_client.ProviderError("audit_unavailable", assessment_error)
             # TWO validation boundaries. The provider contract was enforced
             # inside assess(), BEFORE finalization. This is the second gate: a
             # deterministic integrity check on Python's own final output. The
@@ -899,37 +1230,60 @@ def run_one(jd_path: Path, *, mock: bool, smoke: bool, console: bool = True) -> 
                             (": " + "; ".join(tailoring_quality.get("notes") or []))
                             if tailoring_quality.get("notes") else "")
             assess_log.info("summary: %s", assessment.get("summary"))
-            for match in (assessment.get("strong_matches") or [])[:8]:
-                assess_log.info("strong: %s <- %s (%s)", match.get("requirement"),
-                                match.get("evidence"), match.get("source"))
-            for match in assessment.get("partial_matches") or []:
-                assess_log.info("partial: %s (%s)", match.get("requirement"),
-                                match.get("limitation"))
-            for gap in assessment.get("gaps") or []:
-                assess_log.info("gap: %s [%s/%s]", gap.get("requirement"),
-                                gap.get("importance"), gap.get("status"))
-            for entry in assessment.get("manual_review") or []:
-                assess_log.info("manual review: %s [%s] %s", entry.get("requirement_id"),
-                                entry.get("kind"), entry.get("reason"))
-            for strength in assessment.get("complementary_strengths") or []:
-                assess_log.info("complementary strength (not a requirement): %s", strength)
+            # The per-requirement breakdown stays in strategy.json; the terminal
+            # keeps only the compact advisory summary printed at the end.
+            assess_log.info("classified %d strong, %d partial, %d unsupported, %d manual "
+                            "review (detail in strategy.json)",
+                            len(assessment.get("strong_matches") or []),
+                            len(assessment.get("partial_matches") or []),
+                            len(assessment.get("gaps") or []),
+                            len(assessment.get("manual_review") or []))
             for flag in assessment.get("risk_flags") or []:
                 assess_log.warning("risk flag: %s", flag)
-            if not (assessment.get("gaps") or []):
-                assess_log.info("no unsupported requirement found; gaps array is "
-                                "intentionally empty")
             assessment_available = True
         except llm_client.ProviderError as error:
-            assess_log.warning("assessment unavailable: category=%s %s", error.category, error)
+            assess_log.warning("application audit unavailable: category=%s %s",
+                               error.category, error)
             assessment = {"error": f"{error.category}: {error}"}
             assessment_available = False
             assessment_error = f"{error.category}: {error}"
-        (run_dir / "assessment.json").write_text(json.dumps(assessment, indent=2),
-                                                 encoding="utf-8")
+        # The rich structure stays in memory for validation and strategy.json;
+        # the ARTIFACT is the small advisory report.
+        letter_theme_hits = grounding.letter_themes_covered(
+            letter, [r.headline for r in themes]) if letter else []
+        letter_named_hits = grounding.letter_named_terms(
+            letter, sorted({t for r in themes for t in r.terms})) if letter else []
+        # How many distinct evidence sources the letter actually drew on. The
+        # company-name probe above misses a role paragraph that never names the
+        # employer, and collapses two different roles into one "experience",
+        # so capsule labels are counted alongside it.
+        letter_breadth = set(letter_sources) | {
+            priority["source"] for priority in
+            grounding.supported_priorities(letter_priorities)
+            if letter and grounding.priority_uses_own_source(letter, priority)}
+        # The Cover Letter Score stays deterministic Python on the existing
+        # role-distinctive rubric; the other nine fields come from the audits.
+        letter_score = grounding.cover_letter_score(
+            letter=letter, problems=letter_problems,
+            words=grounding.word_count(letter) if letter else 0,
+            priorities=letter_priorities, themes_covered=len(letter_theme_hits),
+            evidence_sources=len(letter_breadth),
+            named_terms_covered=len(letter_named_hits),
+            company=jd.company_name or "", job_title=jd.job_title or "")
+        compact = assessment_report(audits, letter_score)
+        (run_dir / "assessment.txt").write_text(
+            grounding.render_assessment_txt(compact), encoding="utf-8")
+        result.assessment = compact
+        for name, message in audits["errors"].items():
+            assess_log.warning("%s unavailable (%s); its fields report UNKNOWN",
+                               name.replace("_", " "), message)
 
         # ---- status ------------------------------------------------------
         issues = list(verification.issues)
-        issues += [f"assessment integrity: {p.message}" for p in final_problems]
+        # Assessment is ADVISORY: a verified resume and a valid cover letter are
+        # a success even when scoring is unavailable or malformed.
+        for problem in final_problems:
+            assess_log.warning("assessment integrity (advisory): %s", problem.message)
         # A substantive production posting whose title never resolved is not a
         # clean success: the run folder and the tracking row would both be wrong,
         # so it goes to review rather than being recorded. Same substantive test
@@ -943,10 +1297,11 @@ def run_one(jd_path: Path, *, mock: bool, smoke: bool, console: bool = True) -> 
         issues += [f"project bullet grounding: {p.message}" for p in grounding_problems]
         issues += [f"cover letter: {p.message}" for p in grounding.errors(letter_problems)]
         issues += layout["issues"]
-        # The resume can be perfect while a requested downstream artifact is
-        # unusable. That package is not a clean success.
         if not assessment_available:
-            issues.append(f"assessment unavailable: {assessment_error}")
+            final_warning = (f"assessment unavailable ({assessment_error}); the advisory "
+                             f"fields fall back to UNKNOWN and the run is judged on the "
+                             f"resume and cover letter alone")
+            assess_log.warning("%s", final_warning)
         status = "success" if not issues else "needs_review"
 
         strategy = {
@@ -955,6 +1310,17 @@ def run_one(jd_path: Path, *, mock: bool, smoke: bool, console: bool = True) -> 
             "job_id": jd.job_id,
             "role_family": signals.role_family,
             "section_order": order,
+            # Auditability: the two signal sources, the validated subset and
+            # what the Experience policy actually acted on, kept separate.
+            "jd_signals": {
+                "deterministic_signals": deterministic_map,
+                "gemini_semantic_signals_raw": selection.semantic_signals_raw,
+                "gemini_semantic_signals_validated": validated_signals,
+                "merged_signals": merged_map,
+                "recovered_by_gemini": signal_overrides["added"],
+                "role_family_promoted_to": signal_overrides["role_family"],
+                "rejected": [p.message for p in signal_problems],
+            },
             "experience": {
                 "kept": [bid for bid, action, _ in decision.shipped if action == "KEEP_EXACT"],
                 "swaps": [{"source_id": bid, "target_id": rid, "rule": rule}
@@ -962,6 +1328,15 @@ def run_one(jd_path: Path, *, mock: bool, smoke: bool, console: bool = True) -> 
                 "shipped_ids": decision.shipped_ids,
                 "rule": decision.rule,
                 "wording_source": engine.POLICY_PATH.name,
+                "rule_fired": decision.rule,
+                "resolved_from": ("merged deterministic + validated Gemini signals"
+                                  if signal_overrides["added"]
+                                  else "deterministic signals only"),
+                # Recorded so --assess can rebuild the shipped Experience
+                # exactly, without re-running selection.
+                "shipped": [{"bullet_id": bid, "action": action,
+                             "text": engine.latex_to_plain(latex)}
+                            for bid, action, latex in decision.shipped],
             },
             "projects": {
                 "selected_by_relevance": selection.selected,
@@ -971,6 +1346,11 @@ def run_one(jd_path: Path, *, mock: bool, smoke: bool, console: bool = True) -> 
                 "selected": selection.selected,
                 "selected_is": ("relevance order, identical to selected_by_relevance; the PDF "
                                 "renders display_order instead"),
+                # The final bullets and the full candidate catalogue, so
+                # --assess audits the same option space production did.
+                "bullets": {r.project.project_id: list(r.bullets) for r in renders},
+                "ranks": {pid: selection.ranks.get(pid) for pid in selection.selected},
+                "catalogue": audits["catalogue"],
             },
             "skills": {
                 "baseline": [f"{label}: {', '.join(items)}" for label, items in policy.mandatory],
@@ -1004,6 +1384,15 @@ def run_one(jd_path: Path, *, mock: bool, smoke: bool, console: bool = True) -> 
                     letter, sorted({t for r in themes for t in r.terms})) if letter else [],
                 "validation": "pass" if letter and not grounding.errors(letter_problems)
                               else "fail",
+                "distinctive_priorities": letter_priorities,
+                "priority_coverage": [
+                    {"label": p["label"], "source": p["source_name"],
+                     "addressed": grounding.priority_addressed(letter, p),
+                     "used_own_evidence": grounding.priority_uses_own_source(letter, p)}
+                    for p in grounding.supported_priorities(letter_priorities)] if letter
+                    else [],
+                "relevance": [p.message for p in letter_problems
+                              if p.kind == "relevance"],
             },
             "requirements": {
                 "extracted": [req.as_dict() for req in requirements],
@@ -1028,11 +1417,41 @@ def run_one(jd_path: Path, *, mock: bool, smoke: bool, console: bool = True) -> 
                 "strong_matches": len(assessment.get("strong_matches") or []),
                 "partial_matches": len(assessment.get("partial_matches") or []),
                 "gaps": len(assessment.get("gaps") or []),
+                # The per-requirement breakdown lives here now: assessment.txt is
+                # deliberately small, and strategy.json is the debug artifact.
+                "detail": {bucket: assessment.get(bucket) or []
+                           for bucket in ("strong_matches", "partial_matches", "gaps",
+                                          "manual_review")},
+                "summary": assessment.get("summary"),
+                "model_summary": assessment.get("model_summary"),
+                "verdict_source": assessment.get("verdict_source"),
+                "eligibility_detail": (assessment.get("eligibility") or {}).get("details"),
+                "tailoring_notes": (assessment.get("tailoring_quality") or {}).get("notes")
+                                   or [],
+                "risk_flags": assessment.get("risk_flags") or [],
+            },
+            # The audit layer's own record. Component scores, explanations,
+            # missed signals, confidences and source URLs live here; the ten
+            # user-facing fields live in assessment.txt.
+            "audit": {
+                "report": compact,
+                "experience_selection": (audits["application_audit"] or {}).get(
+                    "experience_selection_score"),
+                "application": audits["application_audit"],
+                "company_research": audits["research"],
+                "errors": audits["errors"],
+                "cover_letter_score": letter_score,
+                "provider_calls": [
+                    c.as_dict() for c in client.calls
+                    if c.purpose in ("assessment", "company_research")],
+                "audited_at": datetime.now().isoformat(timespec="seconds"),
             },
             "jd_fingerprint": jd.fingerprint,
             "generated_at": datetime.now().isoformat(timespec="seconds"),
         }
-        (run_dir / "strategy.json").write_text(json.dumps(strategy, indent=2), encoding="utf-8")
+        # ONE persistence operation, after both audit futures resolved, written
+        # atomically so a crash mid-write cannot leave truncated JSON behind.
+        write_json_atomic(run_dir / "strategy.json", strategy)
         result.strategy = strategy
         result.issues = issues
         result.status = status
@@ -1052,6 +1471,10 @@ def run_one(jd_path: Path, *, mock: bool, smoke: bool, console: bool = True) -> 
                        verification.skills_rendered_lines, policy.project_count,
                        "/".join(str(allocation[p]) for p in selection.selected),
                        verification.pages)
+        if status == "success":
+            final_pdf = finalize_artifacts(run_dir, jd, final)
+            if final_pdf:
+                result.pdf_path = final_pdf
         tracker = Tracker(engine.PROCESSED_CSV, engine.PROCESSED_INDEX, enabled=not isolated)
         tracker.record(jd, run_dir, status, log.stage_log("TRACKING"))
         provider_summary = ", ".join(
@@ -1059,6 +1482,13 @@ def run_one(jd_path: Path, *, mock: bool, smoke: bool, console: bool = True) -> 
             for c in client.calls) or "none"
         final.info("provider calls: %s", provider_summary)
         final.info("artifacts: %s", ", ".join(sorted(p.name for p in run_dir.iterdir())))
+        summary = log.stage_log("ASSESSMENT")
+        for field in grounding.ASSESSMENT_FIELDS:
+            summary.info("%s: %s", field, compact.get(field, "UNKNOWN"))
+        # The compact terminal block, printed after every completed job. In
+        # batch mode this lands before the next [BATCH] processing line.
+        print_assessment(compact, company=jd.company_name or "",
+                         job_title=jd.job_title or "")
         return result
 
     except Exception as error:                       # noqa: BLE001 - reported, not hidden
@@ -1096,6 +1526,8 @@ def fit_to_page(run_dir: Path, template: engine.Template, order: list[str],
     issues: list[str] = []
     repairs: dict[tuple[str, int], int] = {}
     verb_repairs: dict[tuple[str, int], int] = {}
+    # Best measured rendering per bullet, so a failed repair can be undone.
+    best_bullets: dict[tuple[str, int], tuple[tuple[int, float], str]] = {}
     iterations = 0
     target = policy.skills_target_lines
     skills_done_logged = False
@@ -1155,6 +1587,7 @@ def fit_to_page(run_dir: Path, template: engine.Template, order: list[str],
                                 ", ".join(short))
 
         # 2. Layout: one page, two rendered lines per project bullet, no orphan tails.
+        _track_best(best_bullets, bullets, renders, policy)
         problems = _layout_problems(bullets, renders, policy, pages)
         for note in problems["notes"]:
             layout_log.info("%s", note)
@@ -1178,6 +1611,7 @@ def fit_to_page(run_dir: Path, template: engine.Template, order: list[str],
         if budget.get(key, 0) >= MAX_REPAIRS_PER_BULLET:
             layout_log.warning("bullet %s#%d already repaired %d time(s); stopping here rather "
                                "than degrading it further", key[0], key[1] + 1, repairs[key])
+            _restore_best(best_bullets, renders, layout_log)
             issues.append(f"{target_action['reason']} (bounded repair exhausted)")
             return {"ok": True, "pdf_path": build.pdf_path, "iterations": iterations,
                     "issues": issues}
@@ -1206,6 +1640,7 @@ def fit_to_page(run_dir: Path, template: engine.Template, order: list[str],
                 layout_log.warning("the repair returned the bullet unchanged; no natural "
                                    "rewording is available without weakening the facts")
             issues.append(f"{target_action['reason']} (no truthful repair available)")
+            _restore_best(best_bullets, renders, layout_log)
             return {"ok": True, "pdf_path": build.pdf_path, "iterations": iterations,
                     "issues": issues}
         layout_log.info("accepted repair: %s", revised)
@@ -1265,14 +1700,23 @@ def _fill_skills(state: engine.SkillsState, policy: engine.Policy, categories,
     decides which one goes in. Nothing is invented, and an addition that costs
     a ninth line is reverted on the next measurement.
     """
-    under = sorted((m for m in categories
-                    if m.lines >= 2 and m.last_line_fill < policy.second_line_max_fill),
-                   key=lambda m: m.last_line_fill)
-    for metric in under:
+    under = [(m, FILL_MAX_TIER) for m in sorted(
+        (m for m in categories
+         if m.lines >= 2 and m.last_line_fill < policy.second_line_max_fill),
+        key=lambda m: m.last_line_fill)]
+    # A DIRECT JD match (tier 1-2: the posting names it and the master supports
+    # it) may also join a single-line category that still has room on that
+    # line. This is what lets "React" surface when a posting asks for it while
+    # the category holds only one line. An addition that costs a ninth line is
+    # reverted on the next measurement, so the 8-line contract is unchanged.
+    under += [(m, 2) for m in sorted(
+        (m for m in categories if m.lines == 1 and m.last_line_fill < 90.0),
+        key=lambda m: m.last_line_fill)]
+    for metric, max_tier in under:
         for candidate in state.candidates:
             if candidate.category != metric.label:
                 continue
-            if candidate.tier > FILL_MAX_TIER:
+            if candidate.tier > max_tier:
                 continue
             if state.is_rejected(candidate.name):
                 continue
@@ -1281,9 +1725,8 @@ def _fill_skills(state: engine.SkillsState, policy: engine.Policy, categories,
             if state.add(candidate):
                 log.info("iteration action=ADD skill=%r category=%r tier=%d reason=%s",
                          candidate.name, candidate.category, candidate.tier,
-                         f"{candidate.reason}; {metric.label} second line was only "
-                         f"{metric.last_line_fill:.0f}% full against the "
-                         f"{policy.second_line_max_fill:.0f}% fill limit")
+                         f"{candidate.reason}; {metric.label} last line was only "
+                         f"{metric.last_line_fill:.0f}% full")
                 return True
     return False
 
@@ -1323,6 +1766,51 @@ def _verb_action(lines, right_edge: float, renders: list[engine.ProjectRender],
                        f"spreadsheet limit is {policy.verb_max_uses}")}
 
 
+def _bullet_rank(lines: int, fill: float, target: int, orphan: float) -> tuple[int, float]:
+    """Order candidate renderings of one bullet, best last.
+
+    A two-line bullet with a thin tail is genuinely better than a one-line
+    bullet, even though neither satisfies the contract, so a repair can never
+    justify collapsing two lines into one.
+    """
+    if lines == target and fill >= orphan:
+        return (3, fill)
+    if lines == target:
+        return (2, fill)
+    if lines > target:
+        return (1, -float(lines))
+    return (0, fill)
+
+
+def _track_best(best: dict, bullets, renders, policy: engine.Policy) -> None:
+    """Remember the best measured text seen for every project bullet."""
+    flat: list[tuple[str, int]] = []
+    for render in renders:
+        for index in range(len(render.bullets)):
+            flat.append((render.project.project_id, index))
+    for position, measured in enumerate(bullets):
+        if position >= len(flat):
+            break
+        key = flat[position]
+        render = next(r for r in renders if r.project.project_id == key[0])
+        text = render.bullets[key[1]]
+        rank = _bullet_rank(measured.lines, measured.fill_pct,
+                            policy.bullet_target_lines, policy.tail_orphan_max)
+        if key not in best or rank > best[key][0]:
+            best[key] = (rank, text)
+
+
+def _restore_best(best: dict, renders, log: StageLog) -> None:
+    """Put every bullet back to the best rendering measured for it."""
+    for render in renders:
+        for index, text in enumerate(render.bullets):
+            entry = best.get((render.project.project_id, index))
+            if entry and entry[1] != text:
+                render.bullets[index] = entry[1]
+                log.info("restored the best measured text for %s#%d rather than keeping a "
+                         "degraded repair", render.project.project_id, index + 1)
+
+
 def _layout_problems(bullets, renders, policy: engine.Policy, pages: int) -> dict:
     """Compare rendered project bullets against the layout contract."""
     notes, actions = [], []
@@ -1348,9 +1836,14 @@ def _layout_problems(bullets, renders, policy: engine.Policy, pages: int) -> dic
                             "reason": f"renders only {bullet.lines} line(s), the contract is "
                                       f"{policy.bullet_target_lines}"})
         elif verdict == "hard_orphan":
-            actions.append({"project_id": project_id, "bullet_index": index, "goal": "shorten",
+            # Two lines with a thin tail needs MORE text on that second line,
+            # not less: shortening collapses it to a single line, which is the
+            # worse contract violation.
+            actions.append({"project_id": project_id, "bullet_index": index,
+                            "goal": "lengthen",
                             "reason": f"last line is only {bullet.fill_pct:.0f}% full, below the "
-                                      f"{policy.tail_orphan_max:.0f}% orphan floor"})
+                                      f"{policy.tail_orphan_max:.0f}% orphan floor; it needs "
+                                      f"more of this project's evidence, not less"})
 
     if pages > policy.page_count and not actions:
         longest = max(range(len(bullets)), key=lambda i: bullets[i].lines, default=None)
@@ -1363,6 +1856,212 @@ def _layout_problems(bullets, renders, policy: engine.Policy, pages: int) -> dic
 
 
 # ================================================================ revalidate
+
+
+# Files --assess is forbidden to touch. Hashed before and after, so a bug
+# cannot quietly rewrite a shipped artifact.
+ASSESS_READONLY = ("resume.tex", "resume.txt", "cover_letter.txt", "job_description.txt")
+
+
+def _digests(run_dir: Path) -> dict[str, str]:
+    """SHA256 of every artifact --assess must leave alone, PDFs included."""
+    import hashlib
+
+    out: dict[str, str] = {}
+    for name in ASSESS_READONLY:
+        path = run_dir / name
+        if path.exists():
+            out[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    for pdf_file in sorted(run_dir.glob("*.pdf")):
+        out[pdf_file.name] = hashlib.sha256(pdf_file.read_bytes()).hexdigest()
+    return out
+
+
+def _decision_from_strategy(strategy: dict, policy: engine.Policy
+                            ) -> engine.ExperienceDecision:
+    """Rebuild the shipped Experience decision from the recorded ids.
+
+    Reconstruction, never re-selection: the ids and the rule come from
+    strategy.json, and the wording comes from the approved library by id. No
+    swap rule is re-evaluated and no signal is re-read.
+    """
+    block = strategy.get("experience") or {}
+    shipped_ids = list(block.get("shipped_ids") or [])
+    by_id = {entry.bullet_id: entry for entry in policy.experience_library}
+    by_id.update({entry.bullet_id: entry for entry in policy.alternate_library})
+    recorded = {row.get("bullet_id"): row for row in (block.get("shipped") or [])}
+    shipped: list[tuple[str, str, str]] = []
+    for bullet_id in shipped_ids:
+        entry = by_id.get(bullet_id)
+        action = (recorded.get(bullet_id) or {}).get("action", "KEEP_EXACT")
+        shipped.append((bullet_id, action, entry.latex if entry else
+                        (recorded.get(bullet_id) or {}).get("text", "")))
+    swaps = [(row.get("source_id", ""), row.get("target_id", ""), row.get("rule", ""))
+             for row in (block.get("swaps") or [])]
+    return engine.ExperienceDecision(
+        latex_block="", shipped=shipped, swaps=swaps,
+        rule=block.get("rule") or "unrecorded", allowed_plain=set(),
+        expected_plain=[], shipped_ids=shipped_ids)
+
+
+def assess_run(run_dir: Path, *, mock: bool = False, console: bool = True) -> RunResult:
+    """Standalone audit of an existing run folder.
+
+    Runs exactly the same three audit functions production uses, reading the
+    artifacts that are already on disk. It regenerates nothing, compiles
+    nothing and never opens production tracking: the only things it may write
+    are assessment.txt and the audit block inside strategy.json.
+    """
+    credentials = engine.load_credentials()
+    logger, buffers = build_logger(credentials.secrets, console=console)
+    log = StageLog(logger, "ASSESS")
+    result = RunResult(jd_path=run_dir, run_dir=run_dir)
+    handler = buffers[0].attach_file(run_dir / "assessment.log", logger)
+    before = _digests(run_dir)
+    try:
+        strategy_path = run_dir / "strategy.json"
+        jd_file = run_dir / "job_description.txt"
+        for required in (strategy_path, jd_file):
+            if not required.exists():
+                raise engine.PolicyError(f"{run_dir} has no {required.name}; "
+                                         f"--assess needs the original run artifacts")
+        strategy = json.loads(strategy_path.read_text(encoding="utf-8"))
+        master = engine.load_master()
+        policy = engine.load_policy()
+        jd = engine.read_jd(jd_file)
+        signals = engine.classify_jd(jd.text, master.section_order)
+        requirements = engine.extract_jd_requirements(jd.text, master)
+        decision = _decision_from_strategy(strategy, policy)
+        log.info("auditing %s", run_dir.name)
+        log.info("company=%r title=%r", jd.company_name, jd.job_title)
+        log.info("reconstructed %d shipped Experience bullet(s) from strategy.json: %s",
+                 len(decision.shipped_ids), ", ".join(decision.shipped_ids))
+
+        projects_block = strategy.get("projects") or {}
+        selected_ids = list(projects_block.get("selected_by_relevance") or [])
+        bullets = {pid: list(value) for pid, value in
+                   (projects_block.get("bullets") or {}).items()}
+        chosen = [master.project(pid) for pid in selected_ids if master.project(pid)]
+        if not bullets:
+            # An older run folder predates the recorded bullets. The bullet
+            # audit degrades rather than inventing wording.
+            log.warning("strategy.json records no project bullets; the project bullet "
+                        "audit will score from evidence alone")
+        selection = llm_client.Selection(
+            selected=selected_ids,
+            ranks={pid: rank for pid, rank in (projects_block.get("ranks") or {}).items()
+                   if isinstance(rank, int)},
+            reasons=dict(projects_block.get("selection_reasons") or {}),
+            considered=[])
+        skills = list((strategy.get("skills") or {}).get("rendered") or [])
+        verification = strategy.get("verification") or {}
+        tailoring_signals = {
+            "skills_rendered_lines": verification.get("skills_rendered_lines"),
+            "experience_exact": verification.get("experience_exact"),
+            "pages": verification.get("pages"),
+            "projects": ", ".join(selected_ids),
+            "issues": verification.get("issues") or [],
+        }
+        # 0 Gemini calls: the audit transport is the only one built here, and
+        # audits never fall back to it anyway.
+        client = llm_client.build_client(master, policy, log.stage_log("PROVIDER"),
+                                         mock=mock, credentials=credentials)
+        audits = run_audits(
+            client, jd, signals, decision, policy=policy, master=master,
+            selection=selection, chosen=chosen, project_bullets=bullets,
+            display_order=list(projects_block.get("display_order") or []),
+            allocation=dict(projects_block.get("allocation") or {}),
+            skills=skills,
+            experience_plain=[engine.latex_to_plain(latex)
+                              for _, _, latex in decision.shipped],
+            requirements=requirements, tailoring=tailoring_signals,
+            extra_experience=[entry.plain for entry in policy.experience_library
+                              if entry.is_role_header],
+            log=log,
+            experience_context={
+                # Recorded by the original run, so the audit judges the same
+                # decision that shipped rather than re-deriving one.
+                "merged_signals": (strategy.get("jd_signals") or {}).get(
+                    "merged_signals") or grounding.deterministic_signal_map(signals),
+                "rule": (strategy.get("experience") or {}).get("rule") or decision.rule,
+                "swaps": [(row.get("source_id", ""), row.get("target_id", ""))
+                          for row in ((strategy.get("experience") or {}).get("swaps") or [])],
+                "shipped_ids": list(decision.shipped_ids),
+            })
+
+        # The Cover Letter Score is recomputed deterministically from the
+        # letter already on disk. No provider call, no regeneration.
+        letter_path = run_dir / "cover_letter.txt"
+        letter = letter_path.read_text(encoding="utf-8") if letter_path.exists() else ""
+        letter_score = (strategy.get("audit") or {}).get("cover_letter_score")
+        if letter:
+            capsules = engine.source_capsules(master, chosen)
+            priorities = grounding.letter_priorities(
+                jd_text=jd.text, job_title=jd.job_title or "", requirements=requirements,
+                capsules=capsules, master=master, on_resume=selected_ids)
+            themes = engine.jd_themes(requirements, 5)
+            named = sorted({term for req in themes for term in req.terms})
+            sources = {p["source"] for p in grounding.supported_priorities(priorities)
+                       if grounding.priority_uses_own_source(letter, p)}
+            letter_score = grounding.cover_letter_score(
+                letter=letter, problems=[], words=grounding.word_count(letter),
+                priorities=priorities,
+                themes_covered=len(grounding.letter_themes_covered(
+                    letter, [r.headline for r in themes])),
+                evidence_sources=len(sources),
+                named_terms_covered=len(grounding.letter_named_terms(letter, named)),
+                company=jd.company_name or "", job_title=jd.job_title or "")
+            log.info("cover letter score recomputed deterministically from the artifact "
+                     "on disk: %s", letter_score)
+
+        report = assessment_report(audits, letter_score)
+        (run_dir / "assessment.txt").write_text(
+            grounding.render_assessment_txt(report), encoding="utf-8")
+        # ONLY the audit/assessment metadata is updated. Every other key in
+        # strategy.json is written back exactly as it was read.
+        strategy["audit"] = {
+            "report": report,
+            "experience_selection": (audits["application_audit"] or {}).get(
+                "experience_selection_score"),
+            "application": audits["application_audit"],
+            "company_research": audits["research"],
+            "errors": audits["errors"],
+            "cover_letter_score": letter_score,
+            "provider_calls": [c.as_dict() for c in client.calls],
+            "audited_at": datetime.now().isoformat(timespec="seconds"),
+            "mode": "standalone --assess",
+        }
+        # strategy.json was loaded ONCE above and is persisted ONCE here, in
+        # the coordinator thread, atomically. The audit workers wrote nothing.
+        write_json_atomic(strategy_path, strategy)
+        result.assessment = report
+        result.strategy = strategy
+
+        after = _digests(run_dir)
+        changed = [name for name, digest in before.items() if after.get(name) != digest]
+        if changed:
+            # Belt and braces: report it loudly rather than let it pass.
+            raise engine.PolicyError(
+                "--assess modified artifacts it must never touch: " + ", ".join(changed))
+        log.info("generation artifacts unchanged (sha256 verified): %s",
+                 ", ".join(sorted(before)))
+        gemini = [c for c in client.calls if c.provider == "gemini"]
+        log.info("provider calls: %s", ", ".join(
+            f"{c.purpose}:{c.provider}" for c in client.calls) or "none")
+        log.info("gemini calls: %d (must be 0)", len(gemini))
+        result.issues = [f"{name}: {message}" for name, message in audits["errors"].items()]
+        result.status = "success" if not audits["errors"] else "needs_review"
+        print_assessment(report, company=jd.company_name or "",
+                         job_title=jd.job_title or "")
+        return result
+    except Exception as error:                       # noqa: BLE001 - reported, not hidden
+        log.error("standalone assessment failed: %s\n%s", error, traceback.format_exc())
+        result.status = "failed"
+        result.issues.append(f"{type(error).__name__}: {error}")
+        return result
+    finally:
+        handler.close()
+        logger.removeHandler(handler)
 
 
 def revalidate(run_dir: Path, console: bool = True) -> RunResult:
@@ -1386,6 +2085,12 @@ def revalidate(run_dir: Path, console: bool = True) -> RunResult:
                  "rule=%r, swaps=%s", signals.role_family, decision.rule, decision.swap_summary)
 
         pdf_path = run_dir / f"{RESUME_STEM}.pdf"
+        if not pdf_path.exists():
+            # A successful run renames the PDF to <Company>_<Job_Title>.pdf.
+            renamed = sorted(p for p in run_dir.glob("*.pdf")
+                             if p.name != f"{RESUME_STEM}.pdf")
+            if len(renamed) == 1:
+                pdf_path = renamed[0]
         if not pdf_path.exists():
             tex = run_dir / f"{RESUME_STEM}.tex"
             if not tex.exists():
@@ -1525,6 +2230,8 @@ def run_batch(folder: Path, *, mock: bool = False, smoke: bool = False,
     results = []
     for position, path in enumerate(pending, start=1):
         print(f"[BATCH] processing {position}/{len(pending)}: {path.name}")
+        # run_one prints the compact [ASSESSMENT] block itself, so it lands
+        # here - after this job, before the next [BATCH] processing line.
         results.append(run_one(path, mock=mock, smoke=smoke, console=False))
 
     counts: dict[str, int] = {}
@@ -1560,7 +2267,19 @@ def main(argv: list[str] | None = None) -> int:
                         help="process every .txt job description in a folder (default: jobs/)")
     parser.add_argument("--revalidate", type=Path, default=None,
                         help="re-verify an existing run folder with zero API calls")
+    parser.add_argument("--assess", type=Path, default=None, metavar="RUN_FOLDER",
+                        help="re-run the three Groq audits against an existing run folder; "
+                             "regenerates nothing and never touches tracking")
     args = parser.parse_args(argv)
+
+    if args.assess:
+        if not args.assess.is_dir():
+            parser.error(f"no such run folder: {args.assess}")
+        result = assess_run(args.assess, mock=args.mock)
+        print(f"\n{result.status.upper()}: {args.assess}")
+        for issue in result.issues:
+            print(f"  - {issue}")
+        return 0 if result.status == "success" else 1
 
     if args.revalidate:
         result = revalidate(args.revalidate)

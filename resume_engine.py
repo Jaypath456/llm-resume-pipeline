@@ -45,7 +45,9 @@ PROCESSED_INDEX = PROJECT_ROOT / ".processed_index.json"
 
 # Model ids are env-overridable so a retired model never needs a code change.
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+# Optional. There is deliberately NO default: an unset GROQ_MODEL must not
+# silently resurrect a model that was removed from active use.
+GROQ_MODEL = (os.getenv("GROQ_MODEL") or "").strip()
 
 GEMINI_MAX_ACCOUNTS = 8
 RATE_LIMIT_MAX_ATTEMPTS = 3
@@ -736,6 +738,10 @@ def _parse_master_bullets(lines: list[str]):
 _SKILL_PHRASINGS = {
     "oop": ("object oriented programming", "object-oriented programming",
             "object oriented design", "object-oriented design", "object oriented"),
+    # A posting writes "React"; the master's skill is named "ReactJS". Same
+    # library, different spelling. This is never used to claim a neighbour such
+    # as Node.js or TypeScript, which the master does not support at all.
+    "reactjs": ("React", "React.js"),
 }
 
 
@@ -1187,8 +1193,96 @@ _JOB_ID_PATTERNS = (
 )
 
 
+# "As a Software Engineer at Superhuman" - the role may be capitalized.
 _ROLE_AT_RE = re.compile(
-    r"\bAs an?\s+(?P<title>[a-z][a-z /&+-]{2,44}?)\s+at\s+(?P<company>[A-Z][A-Za-z0-9&.\-]{1,28})")
+    r"\bAs an?\s+(?P<title>[A-Za-z][A-Za-z ,/&+-]{2,44}?)\s+at\s+"
+    r"(?P<company>[A-Z][A-Za-z0-9&.\-]{1,28})")
+
+# Company names stated structurally in the body.
+_ABOUT_COMPANY_RE = re.compile(
+    r"^[^\S\n]*About\s+(?P<company>[A-Z][A-Za-z0-9&.\-]*(?:\s+[A-Z][A-Za-z0-9&.\-]*){0,3})"
+    r"[^\S\n]*$", re.MULTILINE)
+_COMPANY_OFFERS_RE = re.compile(
+    r"\b(?P<company>[A-Z][A-Za-z0-9&.\-]*(?:\s+[A-Z][A-Za-z0-9&.\-]*){0,2})\s+"
+    r"(?:offers|provides|is hiring|empowers)\b")
+_AT_COMPANY_RE = re.compile(
+    r"\bAt\s+(?P<company>[A-Z][A-Za-z0-9&.\-]*(?:\s+[A-Z][A-Za-z0-9&.\-]*){0,2})\s*,")
+
+# Words that are never a company name in these patterns.
+_NOT_A_COMPANY = {"the", "us", "our", "this", "you", "your", "we", "a", "an", "all",
+                  "job", "role", "position", "team", "company", "opportunity"}
+
+# "As an Forward Deployed Engineer, you will design ..." - the role stated
+# before a comma and a second-person verb. Real postings get the article wrong
+# ("As an Forward"), so the article is not validated.
+_ROLE_COMMA_RE = re.compile(
+    r"\bAs\s+an?\s+(?P<title>[A-Za-z][A-Za-z /&+-]{2,60}?)\s*,\s*you\s*"
+    r"(?:will|are|'ll|\u2019ll)\b")
+
+
+def _role_comma_title(text: str) -> str | None:
+    """The role from "As a <Role>, you will ..." prose."""
+    for match in _ROLE_COMMA_RE.finditer(text):
+        title = re.sub(r"\s+", " ", match.group("title")).strip(" .,")
+        # "As a software developer at Epic, you'll ..." belongs to the
+        # role-at pattern, which also captures the company.
+        if re.search(r"\bat\b", title, re.IGNORECASE):
+            continue
+        if any(word in title.lower() for word in _TITLE_WORDS):
+            return " ".join(w if w[:1].isupper() else w.capitalize()
+                            for w in title.split())
+    return None
+
+
+# A title printed on its own line under a Description heading.
+_DESCRIPTION_HEADING = re.compile(r"^[^\S\n]*(?:job\s+)?description[^\S\n]*:?[^\S\n]*$",
+                                  re.IGNORECASE)
+
+
+def _clean_company(name: str | None) -> str | None:
+    if not name:
+        return None
+    trimmed = _trim_company(_COMPANY_TAIL.sub("", name.strip(" ,.")).strip())
+    if not trimmed or trimmed.split()[0].lower() in _NOT_A_COMPANY:
+        return None
+    if trimmed.split()[0].lower() in _CHROME_WORDS:
+        return None
+    return trimmed
+
+
+def _body_company(text: str) -> str | None:
+    """Company from explicit body evidence, most reliable pattern first."""
+    for pattern in (_ABOUT_COMPANY_RE, _COMPANY_OFFERS_RE, _AT_COMPANY_RE):
+        for match in pattern.finditer(text):
+            company = _clean_company(match.group("company"))
+            if company:
+                return company
+    return None
+
+
+def _description_title(text: str) -> str | None:
+    """The role printed on the first non-empty line after a Description heading."""
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if not _DESCRIPTION_HEADING.match(line):
+            continue
+        for candidate in lines[index + 1:index + 4]:
+            stripped = candidate.strip()
+            if not stripped:
+                continue
+            if len(stripped.split()) > 10 or stripped.endswith((".", ":")):
+                break
+            if any(word in stripped.lower() for word in _TITLE_WORDS):
+                return re.sub(r"\s+", " ", stripped)
+            break
+    return None
+
+
+def substantive_jd(text: str) -> bool:
+    """Enough prose to expect real metadata. Same test the pipeline guard uses."""
+    words = len(re.findall(r"[A-Za-z][A-Za-z0-9\'\-/+.]*", text))
+    sentences = len([s for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()])
+    return len(text) >= 800 and words >= 120 and sentences >= 5
 _COMPANY_HIRING_RE = re.compile(
     r"\b(?P<company>[A-Z][A-Za-z0-9&.\-]{1,28})\s+is\s+(?:hiring|seeking|looking for)\s+"
     r"(?:an?\s+)?(?P<title>[A-Z][A-Za-z /&+-]{2,44})")
@@ -1287,14 +1381,24 @@ def read_jd(path: Path) -> JobPosting:
 
     company = labelled(r"^\s*company(?:\s*name)?\s*:\s*(.+?)\s*$")
     title = labelled(r"^\s*(?:job\s*title|position|role)\s*:\s*(.+?)\s*$")
+    # The line under a Description heading is the posting's own title, so it
+    # outranks a role phrase recovered from prose ("As a Software Engineer at
+    # Superhuman" loses the ", Early Career" qualifier).
+    title = title or _description_title(text)
     if not (company and title):
         prose_company, prose_title = _prose_metadata(text)
         company = company or prose_company
         title = title or prose_title
-    if not company:
+    # Last title resort before giving up: "As a <Role>, you will ...".
+    title = title or _role_comma_title(text)
+    # Explicit body evidence outranks the filename entirely.
+    company = company or _body_company(text)
+    if not company and not substantive_jd(text):
+        # The filename is a last resort, and never for a substantive posting:
+        # "redwood.txt" is not evidence that the employer is Redwood.
         stem = re.sub(r"[_\-]+", " ", path.stem).strip()
         if stem and len(stem.split()) <= 3:
-            company = stem.title()        # safe filename fallback
+            company = stem.title()
 
     return JobPosting(
         source_file=path.name, text=text,
@@ -2002,6 +2106,7 @@ def _bare(name: str) -> str:
 def _names_skill(jd_text: str, skill: str) -> bool:
     lowered = jd_text.lower()
     forms = {skill, _bare(skill)}
+    forms.update(_SKILL_PHRASINGS.get(fold_term(skill), ()))
     for piece in re.findall(r"\(([^)]*)\)", skill):
         forms.update(p.strip() for p in re.split(r"[/,]", piece))
     if "/" in skill and "(" not in skill:
@@ -2064,6 +2169,42 @@ _REQ_SECTIONS = (
 _PREFERRED_INLINE = (r"\bpreferred\b", r"\bis a plus\b", r"\bnice to have\b",
                      r"\bfamiliarity with\b", r"\bbonus\b", r"\bideally\b")
 _REQUIRED_INLINE = (r"\brequired\b", r"\bmust\b", r"\bstrong\b", r"\bproven\b")
+
+
+# Sections that describe what the EMPLOYER provides, not what the candidate
+# must bring. Matched as whole short headings, with or without a trailing
+# colon, because real postings write "Compensation and Benefits" bare.
+_SUPPRESSED_SECTIONS = (
+    "compensation and benefits", "compensation", "benefits", "our benefits",
+    "benefits and perks", "perks and benefits", "perks", "what we offer",
+    "what you'll get", "what you get", "why you'll love it here", "why join us",
+    "life at", "our culture", "we encourage you to apply", "equal opportunity",
+    "equal employment opportunity", "about the company", "pay transparency",
+)
+
+# Benefit-shaped clauses, for a benefit line that sits outside any heading.
+_BENEFIT_CLAUSE = re.compile(
+    r"\blife insurance\b|\bdisability\b|\bstipends?\b|\bprofessional development "
+    r"budget\b|\bpaid time off\b|\bPTO\b|\bfloating holidays?\b|\bsick time\b|"
+    r"\bRRSP\b|\bfertility\b|\bmental health\b|\bcaregiving\b|\bpet care\b|"
+    r"\bcommuter benefit\b|\btuition reimbursement\b|\bemployee discount\b",
+    re.IGNORECASE)
+
+# A line inside a suppressed section is still a requirement when it plainly
+# states something the CANDIDATE must have or satisfy.
+_CANDIDATE_QUALIFIER = re.compile(
+    r"\byou (?:must|will need|should have)\b|\bcandidates? must\b|\brequired to\b|"
+    r"\bmust (?:have|be|hold|possess)\b|\bdegree\b|\beligible\b|\bauthoriz\w+\b|"
+    r"\bvaccinat\w+\b|\bbackground check\b|\bclearance\b", re.IGNORECASE)
+
+
+def suppressed_section(heading: str) -> bool:
+    """True when a heading introduces employer-provided benefits or boilerplate."""
+    cleaned = " ".join(heading.rstrip(":").strip().lower().split())
+    if not cleaned or len(cleaned.split()) > 6:
+        return False
+    return any(cleaned == name or cleaned.startswith(name + " ")
+               or cleaned.endswith(" " + name) for name in _SUPPRESSED_SECTIONS)
 
 
 _ELIGIBILITY_SECTIONS = ("eligibility", "work authorization", "legal")
@@ -2156,6 +2297,9 @@ _CONDITION_KIND = (
 _LOGISTICS_KIND = (
     r"\brelocat\w*\b", r"\bon-?site\b", r"\bhybrid\b", r"\bremote\b", r"\btravel\b",
     r"\bcommut\w*\b", r"\bbased (?:in|on|at)\b", r"\bin-office\b",
+    # "at least 2 days per week in our San Francisco or Seattle hub"
+    r"\bdays?\s+per\s+week\b", r"\bin[-\s]person\b", r"\bhub\b",
+    r"\bin\s+(?:our|the)\b[^.]{0,40}\b(?:office|hub)\b",
 )
 _SUBJECTIVE_QUALIFICATION = (
     r"\bhistory of\b", r"\bacademic excellence\b", r"\bprofessional success\b",
@@ -2183,13 +2327,34 @@ _MARKETING_LINE = re.compile(
 # score, because a signal is never a scored requirement.
 _JD_SIGNAL_TERMS = (
     "JS", "JavaScript", "TS", "TypeScript", "C#", "Java", "Go", "Rust", "Ruby", "PHP",
-    "Windows", "macOS", "Android", "iOS", "Unix", "Solaris", "Kotlin", "Swift",
+    "profiling", "Windows", "macOS", "Android", "iOS", "Unix", "Solaris", "Kotlin", "Swift",
     "Scala", "React", "Angular", "Vue", "Node.js", "Spring",
     ".NET", "Kubernetes", "Terraform", "Kafka", "Spark", "Airflow", "GraphQL",
     "machine learning", "analytics", "user-centered design", "user centered design",
     "modern development methodologies", "microservices", "CI/CD", "cloud",
     "distributed systems", "data structures", "algorithms", "object-oriented",
 )
+
+
+# Terms that are a programming language ONLY in a language context. "Go" is
+# also a Superhuman product, and a feature list is not a language requirement.
+_CONTEXT_ONLY_LANGUAGES = {"go", "r", "rust", "swift", "ruby"}
+
+_LANGUAGE_CONTEXT = (r"\bprogramming language", r"\blanguages?\b", r"\bcod(?:e|ing)\b",
+                     r"\bproficien\w+\b", r"\bfluent\b", r"\bwritten in\b",
+                     r"\bexperience (?:in|with) (?:one|at least one)\b")
+
+
+def language_context(text: str) -> bool:
+    """True when the sentence is talking about programming languages."""
+    return any(re.search(pattern, text, re.IGNORECASE) for pattern in _LANGUAGE_CONTEXT)
+
+
+def _language_term_allowed(term: str, text: str) -> bool:
+    """Gate an ambiguous language name on its sentence's context."""
+    if fold_term(term) not in _CONTEXT_ONLY_LANGUAGES:
+        return True
+    return language_context(text)
 
 
 def jd_signal_terms(text: str) -> tuple[str, ...]:
@@ -2199,7 +2364,7 @@ def jd_signal_terms(text: str) -> tuple[str, ...]:
     for term in _JD_SIGNAL_TERMS:
         needle = term.lower()
         pattern = r"(?<![a-z0-9+#.])" + re.escape(needle) + r"(?![a-z0-9+#])"
-        if re.search(pattern, lowered):
+        if re.search(pattern, lowered) and _language_term_allowed(term, text):
             found.append(term)
     return tuple(sorted(set(found), key=lambda t: (-len(t), t)))
 
@@ -2289,7 +2454,8 @@ def extract_jd_requirements(jd_text: str, master: MasterFacts) -> list[Requireme
 
     def named_terms(text: str) -> tuple[str, ...]:
         found = [display for _folded, display in vocab.items()
-                 if len(display) >= 2 and _mentions(text, _skill_needles(display))]
+                 if len(display) >= 2 and _mentions(text, _skill_needles(display))
+                 and _language_term_allowed(display, text)]
         return tuple(sorted(set(found), key=lambda t: (-len(t), t)))
 
     def importance_of(text: str, default: str) -> str:
@@ -2310,20 +2476,26 @@ def extract_jd_requirements(jd_text: str, master: MasterFacts) -> list[Requireme
         """
         found = set(named_terms(text))
         for term in _JD_SIGNAL_TERMS:
-            if len(term) >= 2 and _mentions(text, _skill_needles(term)):
+            if (len(term) >= 2 and _mentions(text, _skill_needles(term))
+                    and _language_term_allowed(term, text)):
                 found.add(term)
         return tuple(sorted(found, key=lambda t: (-len(t), t)))
 
     candidates: list[Requirement] = []
 
-    section, section_importance = "", "unclear"
+    section, section_importance, suppressed = "", "unclear", False
     for index, raw in enumerate(lines):
         line = raw.strip()
         if not line:
             continue
         heading = line.rstrip(":").strip().lower()
+        # A benefits/perks heading is recognized with or without a colon, and
+        # everything under it is employer-provided until the next heading.
+        if suppressed_section(line):
+            section, section_importance, suppressed = heading, "unclear", True
+            continue
         if line.endswith(":") and len(heading.split()) <= 5:
-            section, section_importance = heading, "unclear"
+            section, section_importance, suppressed = heading, "unclear", False
             for needle, level in _REQ_SECTIONS:
                 if needle in heading:
                     section_importance = level
@@ -2338,6 +2510,11 @@ def extract_jd_requirements(jd_text: str, master: MasterFacts) -> list[Requireme
             continue
         body = line.lstrip("-*•· ").strip()
         if len(body.split()) < 2 or ignorable(body) or _UI_NAV_LINE.match(body):
+            continue
+        # Inside a benefits section, only a plain candidate qualification counts.
+        if suppressed and not _CANDIDATE_QUALIFIER.search(body):
+            continue
+        if _BENEFIT_CLAUSE.search(body) and not _CANDIDATE_QUALIFIER.search(body):
             continue
         for clause in split_requirement_clauses(body):
             if len(clause.split()) < 2 or ignorable(clause) or _UI_NAV_LINE.match(clause):
@@ -2376,6 +2553,14 @@ def extract_jd_requirements(jd_text: str, master: MasterFacts) -> list[Requireme
             candidates.append(Requirement(
                 sentence, "unclear", terms, "prose", kind="capability",
                 authority="signal", line=index))
+
+    # A graduation gate may be a standalone prose sentence rather than a
+    # bullet, so it is scanned across the whole posting. The normal dedupe
+    # below drops it when a list item already said the same thing.
+    for sentence in graduation_gate_sentences(jd_text):
+        candidates.append(Requirement(
+            sentence, "required", (), "eligibility", kind="eligibility",
+            authority="hard", line=0))
 
     # An explicit list item wins over prose that repeats it.
     accepted: list[Requirement] = []
@@ -2846,6 +3031,55 @@ _GRAD_WINDOW_RE = re.compile(
     r"(?P<hi>[A-Za-z]+\s+\d{4})", re.IGNORECASE)
 _GRAD_BY_RE = re.compile(r"graduat\w*\s+(?:by|before|no later than)\s+"
                          r"(?P<hi>[A-Za-z]+\s+\d{4})", re.IGNORECASE)
+# Year alternatives: "graduating in 2026 or 2027", "2026/2027", "either ... or".
+# A graduation gate written as prose rather than a bullet:
+# "This role is open to candidates graduating in December 2026 or Summer/Fall 2027."
+_GRAD_GATE_SENTENCE = re.compile(
+    r"[^.\n]*\b(?:graduating|expected to graduate|class of|open to candidates "
+    r"graduating|must graduate)\b[^.\n]*\.?", re.IGNORECASE)
+
+_SEASON_MONTHS = {"winter": (1, 3), "spring": (3, 6), "summer": (6, 9),
+                  "fall": (9, 12), "autumn": (9, 12)}
+
+# "December 2026 or Summer/Fall 2027" - each option is a month or season plus a
+# year, and the options are alternatives.
+_GRAD_OPTION_RE = re.compile(
+    r"(?P<labels>(?:[A-Za-z]+)(?:\s*/\s*[A-Za-z]+)*)?\s*(?P<year>(?:19|20)\d{2})")
+
+
+def graduation_gate_sentences(jd_text: str) -> list[str]:
+    """Every sentence anywhere in the posting that gates on graduation."""
+    found: list[str] = []
+    for match in _GRAD_GATE_SENTENCE.finditer(jd_text):
+        sentence = re.sub(r"\s+", " ", match.group(0)).strip()
+        if len(sentence.split()) >= 4 and sentence not in found:
+            found.append(sentence)
+    return found
+
+
+def graduation_options(sentence: str) -> list[tuple[tuple[int, int], tuple[int, int]]]:
+    """Windows a graduation gate allows, as (low, high) month-year pairs."""
+    options: list[tuple[tuple[int, int], tuple[int, int]]] = []
+    for match in _GRAD_OPTION_RE.finditer(sentence):
+        year = int(match.group("year"))
+        labels = [piece.strip().lower()
+                  for piece in re.split(r"\s*/\s*", match.group("labels") or "")
+                  if piece.strip()]
+        months = [_MONTHS[label] for label in labels if label in _MONTHS]
+        seasons = [_SEASON_MONTHS[label] for label in labels if label in _SEASON_MONTHS]
+        if months:
+            options.append(((year, min(months)), (year, max(months))))
+        elif seasons:
+            options.append(((year, min(lo for lo, _ in seasons)),
+                            (year, max(hi for _, hi in seasons))))
+        else:
+            options.append(((year, 1), (year, 12)))
+    return options
+
+
+_GRAD_YEARS_RE = re.compile(
+    r"graduat\w*\s+(?:in\s+|by\s+)?(?:either\s+)?(?P<lo>(?:19|20)\d{2})"
+    r"\s*(?:or|/|-|\u2013|to|and)\s*(?P<hi>(?:19|20)\d{2})", re.IGNORECASE)
 
 
 def _month_year(text: str) -> tuple[int, int] | None:
@@ -2860,10 +3094,27 @@ def graduation_requirement(jd_text: str) -> dict | None:
     if window:
         return {"low": _month_year(window.group("lo")), "high": _month_year(window.group("hi")),
                 "text": re.sub(r"\s+", " ", window.group(0)).strip()}
+    # Checked AFTER the month-range form so an explicit month window still wins.
+    years = _GRAD_YEARS_RE.search(jd_text)
+    if years:
+        low, high = int(years.group("lo")), int(years.group("hi"))
+        if high < low:
+            low, high = high, low
+        return {"low": (low, 1), "high": (high, 12),
+                "text": re.sub(r"\s+", " ", years.group(0)).strip()}
     by = _GRAD_BY_RE.search(jd_text)
     if by:
         return {"low": None, "high": _month_year(by.group("hi")),
                 "text": re.sub(r"\s+", " ", by.group(0)).strip()}
+    # "graduating in December 2026 or Summer/Fall 2027": discrete alternatives
+    # rather than one continuous window.
+    for sentence in graduation_gate_sentences(jd_text):
+        options = graduation_options(sentence)
+        if len(options) >= 2:
+            return {"low": min(low for low, _ in options),
+                    "high": max(high for _, high in options),
+                    "options": options,
+                    "text": sentence.rstrip(".")}
     year = re.search(r"class of ((?:19|20)\d{2})", jd_text, re.IGNORECASE)
     if year:
         return {"low": (int(year.group(1)) - 1, 1), "high": (int(year.group(1)), 12),
@@ -2924,6 +3175,84 @@ def deterministic_assessment(requirements: list[Requirement], master: MasterFact
             "eligibility_flags": flags}
 
 
+_ROLE_HEADER_RE = re.compile(r"^##\s+(?P<title>.+?)\s*$")
+_ROLE_BULLET_RE = re.compile(r"^\*\*(?P<prefix>[A-Z][A-Z0-9]*)(?:[-\s*]|$)")
+
+
+def role_bullet_prefixes(master: MasterFacts) -> dict[str, str]:
+    """Role title (as the capsule id spells it) -> its bullet-id prefix.
+
+    Derived from the master's own structure: a "## <Role> - <Company>" header
+    followed by "**GSD-1**" bullets means that role owns the GSD prefix.
+    """
+    mapping: dict[str, str] = {}
+    current = ""
+    for line in master.raw.splitlines():
+        header = _ROLE_HEADER_RE.match(line)
+        if header:
+            current = re.split(r"\s+[\u2014\u2013-]\s+", header.group("title"))[0].strip()
+            continue
+        bullet = _ROLE_BULLET_RE.match(line.strip())
+        if bullet and current:
+            mapping.setdefault(current, bullet.group("prefix"))
+    return mapping
+
+
+def source_capsules(master: MasterFacts, selected: list[Project] | None = None
+                    ) -> dict[str, str]:
+    """Evidence text grouped by the SOURCE it belongs to.
+
+    One professional role, one project or the general evidence bank is one
+    source. A cover-letter paragraph must stay inside a single source: facts,
+    technologies and metrics may not migrate between them.
+    """
+    grouped: dict[str, list[str]] = {}
+    role_prefixes = role_bullet_prefixes(master)
+    for capsule in master.capsules:
+        identifier = capsule.capsule_id
+        if identifier.startswith("project:"):
+            label = identifier
+        elif identifier.startswith("bank:"):
+            label = "general"
+        elif "additional evidence" in identifier:
+            # Role-level supplements are that ROLE's facts, not a global pool:
+            # HeinOnline's extra evidence must not be attributable to Thesis.
+            title = identifier.replace("(additional evidence)", "").strip()
+            prefix = role_prefixes.get(title)
+            label = f"role:{prefix}" if prefix else "general"
+        else:
+            # "GSD-2", "SWE-ALT-DOCKER" and the role-level "(additional
+            # evidence)" capsule all belong to the same role.
+            head = re.split(r"[-\s(]", identifier, maxsplit=1)[0].strip()
+            label = f"role:{head or identifier}"
+        grouped.setdefault(label, []).append(capsule.text)
+    for project in selected or []:
+        key = f"project:{project.project_id}"
+        grouped.setdefault(key, []).extend(list(project.evidence) + list(project.tech))
+    return {label: " ".join(texts) for label, texts in grouped.items()}
+
+
+def unsupported_jd_concepts(requirements: list[Requirement], master: MasterFacts,
+                            evidence: ResumeEvidence) -> tuple[str, ...]:
+    """JD-named concepts the final resume does NOT support.
+
+    Deterministic authority for cover-letter claims: every term any requirement
+    names is evaluated on its own against the shipped resume, and the ones with
+    no support are returned. A letter may discuss these as the employer's work,
+    never as the candidate's experience.
+    """
+    unsupported: dict[str, str] = {}
+    for requirement in requirements:
+        for term in requirement.terms:
+            key = fold_term(term)
+            if key in unsupported:
+                continue
+            verdict = _evaluate_group((term,), master, evidence)
+            if verdict.status == "unsupported":
+                unsupported[key] = term
+    return tuple(sorted(unsupported.values(), key=lambda t: (-len(t), t)))
+
+
 def verdict_index(verdicts: dict) -> dict[str, str]:
     """requirement_id -> the bucket Python placed it in."""
     index: dict[str, str] = {}
@@ -2967,6 +3296,28 @@ def eligibility_assessment(requirements: list[Requirement], master: MasterFacts,
 
     window = graduation_requirement(jd_text)
     expected = expected_graduation(master)
+    options = (window or {}).get("options")
+    if window and expected and options:
+        # Discrete options: the conferral date must land inside one of them.
+        inside = any(low <= expected <= high for low, high in options)
+        month = _MONTH_LABELS.get(expected[1], "")
+        shown = "; ".join(f"{_MONTH_LABELS.get(low[1], '')} {low[0]}"
+                          + ("" if low == high
+                             else f" to {_MONTH_LABELS.get(high[1], '')} {high[0]}")
+                          for low, high in options)
+        details.append(f"the posting allows {shown} ({window['text']})")
+        details.append(f"official expected degree conferral is {month} {expected[0]}")
+        if inside:
+            status = "meets"
+        else:
+            status = "uncertain"
+            details.append("academic completion and official degree conferral are different "
+                           "dates, and the conferral date does not fall inside any option the "
+                           "posting lists; a human must confirm which date this employer "
+                           "means before any conclusion is drawn")
+            flags.append("MANUAL REVIEW: graduation-window options do not include the "
+                         "official conferral date")
+        return status, details, flags
     if window and expected:
         low, high = window.get("low"), window.get("high")
         inside = (low is None or expected >= low) and (high is None or expected <= high)
