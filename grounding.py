@@ -2648,12 +2648,169 @@ def everify_only(sources: list[dict]) -> bool:
     return not _STEM_OPT_EVIDENCE.search(text)
 
 
+# ---- provenance: a claim is only as good as what was actually fetched ----
+#
+# The live run's unbrowsed retry printed three confident URLs, one of them a
+# fabricated web.archive.org link, and concluded visa=NO with HIGH confidence.
+# A URL the model typed is not evidence. Only the provider's record of tool
+# execution is, so every non-UNKNOWN conclusion has to trace back to it.
+
+RESEARCH_FIELDS_UNKNOWN = {
+    "company_visa_sponsorship": "UNKNOWN",
+    "company_visa_confidence": "LOW",
+    "company_stem_opt_support": "UNKNOWN",
+    "company_stem_opt_confidence": "LOW",
+    "job_posted": "UNKNOWN",
+    "job_posted_confidence": "LOW",
+}
+
+
+def unavailable_research(reason: str) -> dict:
+    """The conservative result when browser-backed research did not happen."""
+    return {
+        **RESEARCH_FIELDS_UNKNOWN,
+        "checked_at": "",
+        "sources": [],
+        "research_available": False,
+        "unavailable_reason": reason,
+        "deterministic_overrides": [
+            f"research unavailable ({reason}); every work-authorization field is UNKNOWN "
+            f"because no browser-backed evidence was obtained. An unbrowsed answer may "
+            f"never establish a current company or job policy."],
+    }
+
+
+def _url_identity(url: str) -> tuple[str, str]:
+    """(host, path) lowercased, for comparing a cited URL to a fetched one."""
+    cleaned = re.sub(r"^https?://", "", str(url or "").strip().lower()).strip("/")
+    if not cleaned:
+        return ("", "")
+    host, _, path = cleaned.partition("/")
+    return (host.removeprefix("www."), path.split("?")[0].split("#")[0])
+
+
+def source_was_browsed(source: dict, browsed: list[dict]) -> bool:
+    """Did the browser actually fetch this citation?
+
+    Host AND path must match something that was fetched. Host alone is not
+    enough: a real careers domain does not vouch for an invented deep link.
+    """
+    host, path = _url_identity(source.get("url"))
+    if not host:
+        return False
+    for entry in browsed or []:
+        fetched_host, fetched_path = _url_identity(entry.get("url"))
+        if host != fetched_host:
+            continue
+        if path == fetched_path or (path and fetched_path.startswith(path)) \
+                or (fetched_path and path.startswith(fetched_path)):
+            return True
+    return False
+
+
+# ---- exact-job identity strength ----------------------------------------
+#
+# A "this_job" restriction is authoritative for the application, so the bar
+# for calling a source "this_job" is the highest: it must actually be THIS
+# posting. Title alone is not, because a company can hold several postings
+# with the same title in different places.
+
+def _location_terms(jd_text: str) -> list[str]:
+    """Location-ish tokens the posting itself states, if any."""
+    found: list[str] = []
+    for match in re.finditer(
+            r"^\s*(?:location|city|state|work\s*location|site)\s*:\s*(.+)$",
+            jd_text or "", re.IGNORECASE | re.MULTILINE):
+        found.append(match.group(1).strip().lower())
+    for match in re.finditer(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?),\s*([A-Z]{2})\b",
+                             jd_text or ""):
+        found.append(f"{match.group(1)} {match.group(2)}".lower())
+    return [term for term in dict.fromkeys(found) if term]
+
+
+def exact_job_identity(source: dict, *, jd_text: str, job_id: str,
+                       company: str = "", title: str = "") -> tuple[bool, str]:
+    """May this source be treated as evidence about the EXACT audited posting?
+
+    Strongest: the job id / requisition id appears in the URL or evidence.
+    Acceptable: company AND title AND a location the posting itself states.
+    Insufficient: title alone, or a geography-specific source when the audited
+    posting names no location to match it against.
+    """
+    blob = f"{source.get('url','')} {source.get('title','')} {source.get('evidence','')}"
+    lowered = blob.lower()
+    if job_id and job_id.strip().lower() in lowered:
+        return True, f"job id {job_id!r} present in the source"
+
+    locations = _location_terms(jd_text)
+    source_places = _location_terms(blob)
+    has_company = bool(company) and company.split("(")[0].strip().lower() in lowered
+    has_title = bool(title) and title.split(",")[0].strip().lower() in lowered
+    if source_places and not locations:
+        return False, ("the source is geography-specific but the audited posting states no "
+                       "location to match it against")
+    if has_company and has_title and locations and any(
+            place in lowered for place in locations):
+        return True, "company, title and the posting's own location all match"
+    if has_title and not (has_company and locations):
+        return False, ("title alone cannot identify the exact posting; no job id, and no "
+                       "company-plus-location match")
+    return False, "no job id, and not enough identity to match the exact posting"
+
+
 def validate_company_research(data: dict, *, jd_text: str = "",
-                              jd_posted: str = "UNKNOWN") -> tuple[dict, list[Problem]]:
-    """Groq call #3, with the two over-reading rules enforced deterministically."""
+                              jd_posted: str = "UNKNOWN",
+                              browser_sources: list[dict] | None = None,
+                              jd_job_id: str = "", company: str = "",
+                              title: str = "") -> tuple[dict, list[Problem]]:
+    """Groq call #3, with the over-reading rules enforced deterministically.
+
+    `browser_sources` is the provider's record of what the browsing tool
+    actually fetched. When it is empty, NO current conclusion may stand: that
+    is the invariant the live run broke when an unbrowsed retry reported
+    visa=NO at HIGH confidence from three URLs it had never visited.
+    """
     problems: list[Problem] = []
     source = data if isinstance(data, dict) else {}
     sources = _sources(source.get("sources"))
+    browsed = list(browser_sources or [])
+
+    # No browser evidence at all: nothing here can establish a current policy.
+    if not browsed:
+        research = unavailable_research(
+            "the research reply cited no browser-fetched sources, so it rests on model "
+            "memory rather than current evidence")
+        problems.append(Problem("provenance", "warning",
+                                f"research answer discarded: {len(sources)} cited "
+                                f"source(s) but no browser-fetched evidence"))
+        return research, problems
+
+    # Drop every citation the browser did not actually fetch.
+    verified, invented = [], []
+    for entry in sources:
+        if source_was_browsed(entry, browsed):
+            verified.append(entry)
+        else:
+            invented.append(entry)
+    for entry in invented:
+        problems.append(Problem("provenance", "warning",
+                                f"source {entry.get('url') or entry.get('title')!r} was "
+                                f"not among the browser-fetched pages and is discarded"))
+    sources = verified
+
+    # An exact-job restriction is authoritative, so its identity bar is the
+    # highest. A source that cannot prove it is THIS posting is demoted.
+    for entry in sources:
+        if entry.get("scope") != "this_job":
+            continue
+        ok, why = exact_job_identity(entry, jd_text=jd_text, job_id=jd_job_id,
+                                     company=company, title=title)
+        if not ok:
+            entry["scope"] = "context"
+            entry["scope_demoted"] = why
+            problems.append(Problem("provenance", "warning",
+                                    f"source {entry.get('url')!r} claimed to be the exact "
+                                    f"audited posting but {why}; treated as context"))
 
     sponsorship = _enum(source.get("company_visa_sponsorship"), TERNARY) or "UNKNOWN"
     sponsor_confidence = _enum(source.get("company_visa_confidence"),
@@ -2673,13 +2830,17 @@ def validate_company_research(data: dict, *, jd_text: str = "",
     # about the company or about this exact job. An unrelated requisition is
     # supporting context and can establish nothing on its own.
     authoritative = authoritative_sources(sources)
-    if sponsorship in ("YES", "NO") and sources and not authoritative:
+    # A verdict needs at least one authoritative source, whether the reply
+    # cited none at all or cited only unrelated ones. "No reliable evidence"
+    # is UNKNOWN in both cases.
+    if sponsorship in ("YES", "NO") and not authoritative:
         overrides.append(
-            f"company visa sponsorship reset to UNKNOWN: the only evidence is "
-            f"{sources[0].get('scope', 'context')}-scoped, which cannot establish a "
-            f"company-wide position")
+            f"company visa sponsorship reset to UNKNOWN: "
+            + (f"the only evidence is {sources[0].get('scope', 'context')}-scoped, which "
+               f"cannot establish a company-wide position" if sources else
+               "the answer cited no company-level or job-specific source at all"))
         sponsorship, sponsor_confidence = "UNKNOWN", "LOW"
-    if stem in ("YES", "NO") and sources and not authoritative:
+    if stem in ("YES", "NO") and not authoritative:
         overrides.append("company STEM OPT support reset to UNKNOWN: no company-level or "
                          "job-specific evidence was cited")
         stem, stem_confidence = "UNKNOWN", "LOW"
@@ -2748,6 +2909,9 @@ def validate_company_research(data: dict, *, jd_text: str = "",
                                 "company research returned no sources"))
 
     research = {
+        "research_available": True,
+        "unavailable_reason": "",
+        "browser_sources": [entry.get("url") for entry in browsed][:12],
         "company_visa_sponsorship": sponsorship,
         "company_visa_confidence": sponsor_confidence,
         "company_stem_opt_support": stem,

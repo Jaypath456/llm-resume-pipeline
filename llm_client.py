@@ -120,12 +120,21 @@ NON_RETRYABLE_CATEGORIES = frozenset({
     "daily_limit_exhausted", "quota_exhausted",
     # A rejected schema is a bug in our request, not bad luck.
     "schema_rejected",
+    # Deterministic request/parser failures. Recovery, where it is possible at
+    # all, belongs to the CALLER, which knows whether a simpler output shape is
+    # an acceptable second try - the transport must not silently reshape a
+    # request on its own.
+    "output_parse_failed", "browser_unavailable",
 })
 
 
 BULLET_ATTEMPTS = 3
 LETTER_ATTEMPTS = 3
 ASSESSMENT_ATTEMPTS = 3
+# Company research: at most two generations, BOTH browser-required. Attempt 2
+# only ever differs in output formatting, never in the factual task and never
+# in whether it browsed.
+RESEARCH_ATTEMPTS = 2
 
 # Groq bills a request as prompt + RESERVED output, and the on-demand tier's
 # tokens-per-minute budget is small. A blanket 4096-token reservation made the
@@ -224,6 +233,14 @@ class FailFast(ProviderError):
 # The provider's several ways of saying "I ran out of completion budget".
 # Checked before any schema test, because a truncated strict-mode document is
 # reported as a validation failure even though the schema was accepted.
+# The provider genuinely refusing the browsing tool, as opposed to failing to
+# parse its own answer. Only this means "browsing is not available here".
+_BROWSER_UNAVAILABLE = re.compile(
+    r"browser_search|browser search|tool[_ ]choice|tool(?:s)?\s+(?:are\s+)?not\s+"
+    r"(?:supported|available|enabled)|does not support tool|unsupported tool|"
+    r"tool calling is not",
+    re.IGNORECASE)
+
 _TRUNCATED_OUTPUT = re.compile(
     r"max[_ ]completion[_ ]tokens|max completion tokens reached|"
     r"output was truncated|was truncated to fit|missing required content|"
@@ -265,6 +282,15 @@ def classify_http(status: int, body: str) -> str:
         # that a schema rejection sends you hunting the wrong bug.
         if _TRUNCATED_OUTPUT.search(lowered):
             return "output_truncated"
+        # The live research failure. "output_parse_fail" means the model's
+        # output could not be parsed - the browsing tool was NOT rejected, and
+        # reading it as a tool rejection is what produced an unbrowsed retry
+        # that invented three URLs and a HIGH-confidence sponsorship verdict.
+        if "output_parse_fail" in lowered or "generated output that could not be parsed" \
+                in lowered:
+            return "output_parse_failed"
+        if _BROWSER_UNAVAILABLE.search(lowered):
+            return "browser_unavailable"
         # A schema the endpoint will not accept is a configuration bug, not a
         # transient failure: it must surface, never be retried into a looser
         # mode.
@@ -289,6 +315,12 @@ def classify_exception(error: Exception) -> str:
         return "bad_request"
     if _TRUNCATED_OUTPUT.search(text):
         return "output_truncated"
+    # The live research failure arrives as an SDK exception, so it must be
+    # recognised here too, ahead of the generic 400/"invalid" catch-all.
+    if "output_parse_fail" in text or "generated output that could not be parsed" in text:
+        return "output_parse_failed"
+    if _BROWSER_UNAVAILABLE.search(text):
+        return "browser_unavailable"
     if re.search(r"\bitpm\b|input tokens per minute", text):
         return "input_rate_limited"
     if re.search(r"\botpm\b|output tokens per minute", text):
@@ -341,6 +373,44 @@ def _backoff(attempt: int) -> float:
 
 
 # =============================================================== transports
+
+
+def browser_provenance(message) -> list[dict]:
+    """What the browsing tool ACTUALLY fetched, per the provider's own record.
+
+    Groq reports built-in tool execution on `message.executed_tools`, with
+    `browser_results` (url/title/content) and `search_results.results`
+    (url/title/content). That record is the only trustworthy provenance: a URL
+    the model merely printed in its answer proves nothing, and the live run
+    printed three - one of them a fabricated web.archive.org link - after a
+    retry that never browsed at all.
+
+    Returns [] when nothing was executed, which the research caller treats as
+    "no browser evidence" rather than as an empty result set.
+    """
+    found: list[dict] = []
+    seen: set[str] = set()
+
+    def keep(entry, kind: str) -> None:
+        url = str(getattr(entry, "url", "") or "").strip()
+        if not url or url in seen:
+            return
+        seen.add(url)
+        found.append({
+            "url": url,
+            "title": str(getattr(entry, "title", "") or "").strip()[:200],
+            "snippet": re.sub(r"\s+", " ",
+                              str(getattr(entry, "content", "") or "")).strip()[:400],
+            "via": kind,
+        })
+
+    for tool in (getattr(message, "executed_tools", None) or []):
+        for entry in (getattr(tool, "browser_results", None) or []):
+            keep(entry, "browser")
+        results = getattr(tool, "search_results", None)
+        for entry in (getattr(results, "results", None) or []):
+            keep(entry, "search")
+    return found
 
 
 class GeminiTransport:
@@ -677,9 +747,6 @@ class GroqTransport:
         self.log = log
         self.model = (model or "").strip()
         self.fallback = fallback
-        # Flipped for the rest of the process once the endpoint proves it does
-        # not accept the browsing tool, so one rejection is not paid per call.
-        self.no_web_search = False
         self.budget = budget if budget is not None else budget_for(self.model)
         # OUTPUT tokens per minute, paced separately because it is a separate
         # ceiling. None when this model has no configured OTPM limit.
@@ -692,6 +759,9 @@ class GroqTransport:
         self.last_usage: int | None = None
         self.last_output_usage: int | None = None
         self.last_input_usage: int | None = None
+        # Provenance from the provider's own record of tool execution. Empty
+        # means no browsing happened, whatever the answer claims.
+        self.last_browser_sources: list[dict] = []
         # Deterministic key order. Keys are held here and never logged; a key
         # is only ever identified by its position.
         if keys is None:
@@ -820,6 +890,7 @@ class GroqTransport:
                 self.last_usage = None
                 self.last_output_usage = None
                 self.last_input_usage = None
+                self.last_browser_sources = []
                 text = self._generate(request)
                 if self.last_usage:
                     # Replace the estimate with what the provider actually
@@ -858,14 +929,6 @@ class GroqTransport:
                     self.log.warning("every configured Groq key was rejected for "
                                      "purpose=%s", request.purpose)
                     break
-                if error.category in ("bad_request", "schema_rejected") \
-                        and request.web_search and not self.no_web_search:
-                    # Browsing is optional: retry once without it so the
-                    # research audit degrades to UNKNOWN rather than failing.
-                    self.no_web_search = True
-                    self.log.warning("groq rejected the browsing tool; retrying "
-                                     "purpose=%s without web search", request.purpose)
-                    continue
                 if error.category in ("output_rate_limited", "input_rate_limited"):
                     # The request itself already fits the ceiling (checked
                     # before sending), so this is the rolling window rather
@@ -929,13 +992,13 @@ class GroqTransport:
             settings["reasoning_format"] = request.reasoning_format
         elif request.include_reasoning is not None:
             settings["include_reasoning"] = request.include_reasoning
-        if request.web_search and not self.no_web_search:
-            # Provider-side browsing, used by the company-research audit ONLY.
-            # tool_choice="required" forces the model to actually search rather
-            # than answer from memory: stale sponsorship policy is exactly the
-            # failure this audit exists to avoid. A model or endpoint that
-            # rejects either field produces a bad_request, which generate()
-            # retries once with browsing off so research degrades to UNKNOWN.
+        if request.web_search:
+            # Provider-side browsing, used by the company-research audit ONLY,
+            # and NEVER optional. tool_choice="required" forces the model to
+            # actually search rather than answer from memory. There is no
+            # unbrowsed retry: a research answer with no browser evidence
+            # behind it cannot establish a current policy, so the caller
+            # reports UNKNOWN instead of asking the model what it remembers.
             settings["tools"] = [{"type": "browser_search"}]
             settings["tool_choice"] = "required"
         try:
@@ -954,6 +1017,7 @@ class GroqTransport:
         # Prompt tokens are what the ITPM ceiling counts.
         self.last_input_usage = int(getattr(usage, "prompt_tokens", 0) or 0) or None
         choice = completion.choices[0]
+        self.last_browser_sources = browser_provenance(getattr(choice, "message", None))
         # A reasoning model can spend the whole budget before answering; a
         # truncated cover letter is worse than a retry or a fallback.
         if choice.finish_reason == "length":
@@ -2316,23 +2380,75 @@ Every source you cite must be a real URL you actually consulted.
 
 {_json_instruction(shape)}"""
 
-        reply = self._invoke(self.research, Request(
-            "company_research", prompt, temperature=0.1, web_search=True,
-            max_tokens=AUDIT_OUTPUT_TOKENS["company_research"],
-            **AUDIT_REASONING,
-            # Groq refuses response_format=json_object alongside tool calling
-            # ("json mode cannot be combined with tool/function calling"), and
-            # browsing is the whole point of this call. The shape is required
-            # in the prompt instead, and parse_json tolerates fences or prose.
-            json=False,
-            context={"company": jd.company_name, "job_title": jd.job_title,
-                     "job_id": jd.job_id, "jd_text": jd.text, "today": today,
-                     "jd_posted": jd_posted}))
-        data = parse_json(reply.text, "company_research")
-        research, problems = grounding.validate_company_research(
-            data, jd_text=jd.text, jd_posted=jd_posted)
-        for problem in problems:
-            self.log.warning("[COMPANY RESEARCH] %s", problem.message)
+        # At most TWO generations, both browser-required. Attempt 2 exists
+        # because the live failure was output_parse_fail - the model could not
+        # emit parseable output, which a simpler output shape can fix - NOT a
+        # rejected browsing tool. There is deliberately no unbrowsed attempt:
+        # an answer with no browser evidence behind it may not establish any
+        # current policy, so failure degrades to UNKNOWN instead.
+        simplify = ("\n\nOUTPUT FORMAT - your previous answer could not be parsed. Emit the "
+                    "JSON object and NOTHING else: no preamble, no commentary, no code "
+                    "fence, no trailing text. Keep every factual requirement above "
+                    "unchanged - same task, same evidence rules, same source scoping.")
+        attempts: list[str] = []
+        research: dict | None = None
+        for attempt in range(1, RESEARCH_ATTEMPTS + 1):
+            request = Request(
+                "company_research", prompt + (simplify if attempt > 1 else ""),
+                temperature=0.1,
+                # Browser REQUIRED on every attempt, without exception.
+                web_search=True,
+                max_tokens=AUDIT_OUTPUT_TOKENS["company_research"],
+                **AUDIT_REASONING,
+                # Groq refuses response_format=json_object alongside tool
+                # calling, and browsing is the whole point of this call. The
+                # shape is required in the prompt instead, and parse_json
+                # tolerates fences or prose.
+                json=False,
+                context={"company": jd.company_name, "job_title": jd.job_title,
+                         "job_id": jd.job_id, "jd_text": jd.text, "today": today,
+                         "jd_posted": jd_posted, "attempt": attempt})
+            try:
+                reply = self._invoke(self.research, request)
+            except ProviderError as error:
+                attempts.append(f"attempt {attempt}: {error.category}")
+                self.log.warning("[COMPANY RESEARCH] attempt %d failed: category=%s %s",
+                                 attempt, error.category, error)
+                # Only a parser failure is worth a second, still-browsed try.
+                # Browser unavailability, auth and rate limits are not.
+                if error.category == "output_parse_failed" and attempt < RESEARCH_ATTEMPTS:
+                    self.log.info("[COMPANY RESEARCH] retrying with a simplified output "
+                                  "format; browsing stays REQUIRED")
+                    continue
+                break
+            provenance = list(getattr(self.research, "last_browser_sources", []) or [])
+            self.log.info("[COMPANY RESEARCH] attempt %d returned %d browsed source(s)",
+                          attempt, len(provenance))
+            try:
+                data = parse_json(reply.text, "company_research")
+            except ProviderError as error:
+                attempts.append(f"attempt {attempt}: unparseable reply")
+                self.reject_last(f"unparseable research reply: {error}")
+                if attempt < RESEARCH_ATTEMPTS:
+                    self.log.warning("[COMPANY RESEARCH] attempt %d reply was unparseable; "
+                                     "retrying with a simplified output format", attempt)
+                    continue
+                break
+            research, problems = grounding.validate_company_research(
+                data, jd_text=jd.text, jd_posted=jd_posted, browser_sources=provenance,
+                jd_job_id=jd.job_id or "", company=jd.company_name or "",
+                title=jd.job_title or "")
+            for problem in problems:
+                self.log.warning("[COMPANY RESEARCH] %s", problem.message)
+            break
+
+        if research is None:
+            # Both browser-required attempts are gone. Conservative UNKNOWNs
+            # with an explicit reason; the resume itself is unaffected.
+            reason = "; ".join(attempts) or "no research attempt completed"
+            self.log.warning("[COMPANY RESEARCH] unavailable after %d browser-required "
+                             "attempt(s): %s", len(attempts), reason)
+            research = grounding.unavailable_research(reason)
         for override in research["deterministic_overrides"]:
             self.log.warning("[COMPANY RESEARCH] %s", override)
         return research

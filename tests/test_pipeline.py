@@ -3296,12 +3296,22 @@ class _Verified:
     action_verbs_ok = True
 
 
-def _research(jd_text: str, **overrides) -> dict:
+# A stand-in for one page the browsing tool really fetched. Research now
+# requires provenance for any non-UNKNOWN conclusion, so a policy test has to
+# say that browsing happened - otherwise it is testing the unavailable path.
+BROWSED_SOURCE = {"url": "https://example.com/careers/immigration",
+                  "title": "Immigration policy", "snippet": "policy text",
+                  "via": "browser"}
+
+
+def _research(jd_text: str, browser_sources=(BROWSED_SOURCE,), **overrides) -> dict:
     """Company research exactly as production computes it.
 
-    The provider answers UNKNOWN (mock mode cannot browse) and Python applies
-    the deterministic rules: explicit posting language, the E-Verify rule and
-    the job-level override.
+    `browser_sources` defaults to one fetched page, because these tests are
+    about the deterministic POLICY rules - explicit posting language, the
+    E-Verify rule, the job-level override - which only apply once browsing has
+    actually produced evidence. Pass `browser_sources=()` to exercise the
+    no-evidence path instead.
     """
     payload = {"company_visa_sponsorship": "UNKNOWN", "company_visa_confidence": "LOW",
                "company_stem_opt_support": "UNKNOWN", "company_stem_opt_confidence": "LOW",
@@ -3309,7 +3319,8 @@ def _research(jd_text: str, **overrides) -> dict:
                "checked_at": "2026-09-15", "sources": []}
     payload.update(overrides)
     research, _ = grounding.validate_company_research(
-        payload, jd_text=jd_text, jd_posted=grounding.job_posted_date(jd_text))
+        payload, jd_text=jd_text, jd_posted=grounding.job_posted_date(jd_text),
+        browser_sources=list(browser_sources))
     return research
 
 
@@ -3957,11 +3968,13 @@ def test_the_audit_transport_has_no_gemini_fallback():
 def test_every_audit_call_uses_the_audit_transport():
     """Source contract: the three audit purposes invoke self.audit, not self.groq."""
     source = Path(_llm_client().__file__).read_text(encoding="utf-8")
-    expected = {"assessment": "self.audit", "company_research": "self.research"}
-    for purpose, transport in expected.items():
-        head = source.split(f'"{purpose}", ')[0]
-        invoke = head.rsplit("self._invoke(", 1)[1].split(",")[0].strip()
-        assert invoke == transport, f"{purpose} must be invoked on {transport}"
+    # The assessment builds its Request inline; research builds one in a
+    # bounded loop, so each is checked against its own method body.
+    assess = source.split("    def assess(")[1].split("\n    def ")[0]
+    assert 'self._invoke(self.audit, Request(\n                "assessment"' in assess
+    research = source.split("    def research_company(")[1].split("\n    def ")[0]
+    assert "self._invoke(self.research, request)" in research
+    assert "self.audit" not in research and "self.gemini" not in research
     # Generation is Gemini-only: the cover letter included. Selection goes
     # through _call (which wraps _invoke), so both spellings are accepted.
     for purpose in ("project_selection", "project_bullets", "cover_letter"):
@@ -3996,10 +4009,13 @@ def test_browser_search_is_forced_and_only_for_web_search_requests():
     source = Path(_llm_client().__file__).read_text(encoding="utf-8")
     generate = source.split("def _generate(self, request: Request) -> str:")[1]
     generate = generate.split("# ================")[0]
-    block = generate.split("if request.web_search and not self.no_web_search:")[1]
-    block = block.split("try:")[0]
+    block = generate.split("if request.web_search:")[1].split("completion = client")[0]
     assert '"tools"' in block and "browser_search" in block
     assert 'settings["tool_choice"] = "required"' in block
+    # The guard is web_search alone: there is no second condition that can
+    # switch browsing off for a request that asked for it.
+    assert "if request.web_search:" in generate
+    assert "no_web_search" not in generate
     # Nothing outside that guard may set either field.
     assert generate.count('settings["tool_choice"]') == 1
     assert generate.count('settings["tools"]') == 1
@@ -4012,8 +4028,13 @@ def test_no_generation_request_ever_asks_for_web_search():
         assert "web_search" not in head, f"{purpose} must never browse"
 
 
-def test_unsupported_browser_search_degrades_research_to_unknown():
-    """A rejected tool retries once without browsing, then reports UNKNOWN."""
+def test_an_unavailable_browser_never_degrades_into_an_unbrowsed_answer():
+    """The removed behaviour: a tool refusal used to retry with browsing off.
+
+    That retry is what produced a HIGH-confidence sponsorship verdict from
+    three URLs the model had never visited. Now the request shape never
+    changes, the failure surfaces, and research reports UNKNOWN.
+    """
     import logging
 
     import llm_client
@@ -4022,25 +4043,25 @@ def test_unsupported_browser_search_degrades_research_to_unknown():
 
     class _Rejecting(llm_client.GroqTransport):
         def _generate(self, request):
-            calls.append(request.web_search and not self.no_web_search)
-            if request.web_search and not self.no_web_search:
-                raise llm_client.ProviderError("bad_request", "tools are not supported")
-            return json.dumps({"company_visa_sponsorship": "UNKNOWN",
-                               "company_stem_opt_support": "UNKNOWN",
-                               "job_posted": "UNKNOWN", "checked_at": "2026-09-15",
-                               "sources": []})
+            calls.append(request.web_search)
+            raise llm_client.ProviderError("browser_unavailable",
+                                           "tools are not supported")
 
     credentials = engine.Credentials(has_groq=True, _groq_key="k")
-    transport = _Rejecting(credentials, logging.getLogger("test"), model="m", fallback=None)
-    reply = transport.generate(llm_client.Request("company_research", "p", web_search=True))
-    assert calls == [True, False], calls
-    assert transport.no_web_search is True
-    research, _ = grounding.validate_company_research(json.loads(reply.text))
+    transport = _Rejecting(credentials, logging.getLogger("test"), model="m",
+                            fallback=None, budget=llm_client.TokenBudget(999999))
+    with pytest.raises(llm_client.ProviderError) as raised:
+        transport.generate(llm_client.Request("company_research", "p", web_search=True))
+
+    assert calls == [True], "one attempt, and it browsed"
+    assert raised.value.category == "browser_unavailable"
+    assert not hasattr(transport, "no_web_search")
+    # Whatever an unbrowsed model might have said, it cannot be used.
+    research = grounding.unavailable_research("browser_unavailable")
+    assert research["research_available"] is False
     assert research["company_visa_sponsorship"] == "UNKNOWN"
     assert research["job_posted"] == "UNKNOWN"
 
-
-# ---- audit results never re-enter generation ------------------------------
 
 def c3_signals(c3):
     return engine.classify_jd(c3["jd"].text, c3["master"].section_order)
@@ -4165,6 +4186,17 @@ def test_a_failed_audit_leaves_a_successful_run_successful():
 
 # ---- company research rules -----------------------------------------------
 
+def _browsed_from(data: dict) -> list[dict]:
+    """Provenance that matches whatever URLs this payload cites.
+
+    These tests are about the POLICY rules, not about provenance, so they
+    declare that the browser really fetched the pages they name.
+    """
+    return [{"url": entry.get("url", ""), "title": entry.get("title", ""),
+             "snippet": entry.get("evidence", ""), "via": "browser"}
+            for entry in (data.get("sources") or []) if entry.get("url")]
+
+
 def test_everify_alone_can_never_produce_stem_opt_yes():
     data = {
         "company_visa_sponsorship": "YES", "company_visa_confidence": "HIGH",
@@ -4175,7 +4207,8 @@ def test_everify_alone_can_never_produce_stem_opt_yes():
                      "scope": "company_policy",
                      "evidence": "The company is an E-Verify participating employer."}],
     }
-    research, _ = grounding.validate_company_research(data, jd_text="We are hiring.")
+    research, _ = grounding.validate_company_research(data, jd_text="We are hiring.",
+                                           browser_sources=_browsed_from(data))
     assert research["company_stem_opt_support"] == "UNKNOWN"
     assert research["company_stem_opt_confidence"] == "LOW"
     assert any("E-Verify" in note for note in research["deterministic_overrides"])
@@ -4185,7 +4218,8 @@ def test_everify_alone_can_never_produce_stem_opt_yes():
                             "evidence": "We support the STEM OPT 24-month extension and "
                                         "sign the I-983 training plan."})
     data["company_stem_opt_support"] = "YES"
-    research, _ = grounding.validate_company_research(data, jd_text="We are hiring.")
+    research, _ = grounding.validate_company_research(data, jd_text="We are hiring.",
+                                           browser_sources=_browsed_from(data))
     assert research["company_stem_opt_support"] == "YES"
 
 
@@ -4199,7 +4233,8 @@ def test_historical_h1b_alone_lowers_sponsorship_confidence():
                      "scope": "company_policy",
                      "evidence": "14 H-1B LCA filings were certified in 2024."}],
     }
-    research, _ = grounding.validate_company_research(data, jd_text="We are hiring.")
+    research, _ = grounding.validate_company_research(data, jd_text="We are hiring.",
+                                           browser_sources=_browsed_from(data))
     assert research["company_visa_sponsorship"] == "YES"
     assert research["company_visa_confidence"] == "MEDIUM"
     assert any("H-1B" in note for note in research["deterministic_overrides"])
@@ -4218,7 +4253,8 @@ def test_a_job_level_no_sponsorship_restriction_overrides_company_evidence():
     jd_text = ("Software Engineer\n\nWe do not offer visa sponsorship for this position.\n")
     assert grounding._explicit(jd_text, grounding._SPONSOR_YES,
                                grounding._SPONSOR_NO) == "NO"
-    research, _ = grounding.validate_company_research(data, jd_text=jd_text)
+    research, _ = grounding.validate_company_research(data, jd_text=jd_text,
+                                           browser_sources=_browsed_from(data))
     assert research["company_visa_sponsorship"] == "NO"
     assert research["company_visa_confidence"] == "HIGH"
     assert research["company_stem_opt_support"] == "UNKNOWN"
@@ -4228,12 +4264,14 @@ def test_a_job_level_no_sponsorship_restriction_overrides_company_evidence():
 def test_research_never_substitutes_today_for_the_posting_date():
     today = engine.date.today().isoformat()
     research, _ = grounding.validate_company_research(
-        {"job_posted": "", "checked_at": today, "sources": []}, jd_text="We are hiring.")
+        {"job_posted": "", "checked_at": today, "sources": []},
+        jd_text="We are hiring.", browser_sources=[BROWSED_SOURCE])
     assert research["job_posted"] == "UNKNOWN"
     # A trustworthy date in the posting itself outranks a researched one.
     research, _ = grounding.validate_company_research(
         {"job_posted": "2020-01-01", "checked_at": today, "sources": []},
-        jd_text="We are hiring.", jd_posted="2026-09-01")
+        jd_text="We are hiring.", jd_posted="2026-09-01",
+        browser_sources=[BROWSED_SOURCE])
     assert research["job_posted"] == "2026-09-01"
     assert research["job_posted_confidence"] == "HIGH"
 
@@ -4718,8 +4756,15 @@ def test_a_prose_mode_research_reply_still_parses():
               '"HIGH", "company_stem_opt_support": "UNKNOWN", "job_posted": "2026-09-01", '
               '"checked_at": "2026-09-15", "sources": []}\n```')
     data = llm_client.parse_json(fenced, "company_research")
-    research, _ = grounding.validate_company_research(data, jd_text="We are hiring.")
-    assert research["company_visa_sponsorship"] == "NO"
+    assert data["company_visa_sponsorship"] == "NO", "the code fence was stripped"
+    assert data["job_posted"] == "2026-09-01"
+    # Parsing and validation are separate contracts: this reply cites no
+    # source at all, so no verdict may survive validation however cleanly it
+    # parsed. The posting's own date still does.
+    research, _ = grounding.validate_company_research(
+        data, jd_text="We are hiring.", browser_sources=[BROWSED_SOURCE],
+        jd_posted="2026-09-01")
+    assert research["company_visa_sponsorship"] == "UNKNOWN"
     assert research["job_posted"] == "2026-09-01"
 
 
@@ -5202,10 +5247,10 @@ def test_company_research_path_is_functionally_unchanged(run, c3):
 
 def test_the_audits_are_still_groq_only_after_these_changes():
     source = Path(_llm_client().__file__).read_text(encoding="utf-8")
-    for purpose, transport in (("assessment", "self.audit"),
-                               ("company_research", "self.research")):
-        head = source.split(f'"{purpose}", ')[0]
-        assert head.rsplit("self._invoke(", 1)[1].split(",")[0].strip() == transport
+    assess = source.split("    def assess(")[1].split("\n    def ")[0]
+    assert "self._invoke(self.audit, Request(" in assess
+    research = source.split("    def research_company(")[1].split("\n    def ")[0]
+    assert "self._invoke(self.research, request)" in research
     builder = source.split("def build_client(")[1]
     assert "assessor = GroqTransport(credentials, log, model=assessment_model(), " \
            "fallback=None)" in builder
@@ -5554,12 +5599,17 @@ class _AuditTransport:
     name = "audit-stub"
 
     def __init__(self, payloads: dict, *, delays: dict | None = None,
-                 fail: dict | None = None):
+                 fail: dict | None = None, browser_sources=None):
         self.payloads = payloads
         self.delays = delays or {}
         self.fail = fail or {}
         self.started: list[str] = []
         self.finished: list[str] = []
+        # Research needs provenance for any non-UNKNOWN conclusion, so this
+        # stand-in declares that browsing happened. These tests are about
+        # parallelism and merging, not about provenance.
+        self.last_browser_sources = list(
+            browser_sources if browser_sources is not None else [BROWSED_SOURCE])
         import threading
 
         self._lock = threading.Lock()
@@ -5658,15 +5708,22 @@ def test_one_failing_future_never_cancels_the_other(run, c3, failing, surviving)
 
     # Both calls were still MADE; only one failed.
     assert sorted(transport.started) == ["assessment", "company_research"]
-    key = {"assessment": "application_audit", "company_research": "company_research"}
-    assert key[failing] in audits["errors"]
-    assert key[surviving] not in audits["errors"]
     report = run_pipeline.assessment_report(audits, 9.5)
     if failing == "assessment":
+        # A failed assessment is an error entry; research still answers.
+        assert "application_audit" in audits["errors"]
         assert report["Fit Match Score"] == "UNKNOWN"
         assert report["Company Visa Sponsorship"] == "UNKNOWN"   # honest UNKNOWN
     else:
+        # A failed research call is DATA, not an exception: research_company
+        # returns an explicit unavailable result rather than raising, so the
+        # assessment half is untouched and every research field is UNKNOWN.
+        assert "application_audit" not in audits["errors"]
+        assert audits["research"]["research_available"] is False
+        assert audits["research"]["unavailable_reason"]
         assert report["Fit Match Score"] == "7.4 / 10"
+        assert report["Company Visa Sponsorship"] == "UNKNOWN"
+        assert report["Job Posted"] == "UNKNOWN"
     # Advisory either way: the letter score never depended on a provider.
     assert report["Cover Letter Score"] == "9.5 / 10"
 
@@ -5708,8 +5765,9 @@ def test_the_workers_receive_copies_not_the_live_structures(run, c3):
 
 def test_strategy_json_is_written_exactly_once_per_run():
     source = Path(run_pipeline.__file__).read_text(encoding="utf-8")
-    # Call sites: the generation path, --assess, and the stale-reference park.
-    assert source.count("write_json_atomic(") == 4      # definition + 3 call sites
+    # Call sites: the generation path, --assess, the stale-reference park,
+    # the reconciliation index repoint and the resolved-entry rewrite.
+    assert source.count("write_json_atomic(") == 6      # definition + 5 call sites
     assert 'strategy_path.write_text' not in source
     assert 'json.dumps(strategy' not in source
     for block_name in ("def run_one(", "def assess_run("):
@@ -5721,8 +5779,11 @@ def test_both_audit_results_survive_the_merge_in_either_order(run, c3):
     for delays in ({"assessment": 0.2}, {"company_research": 0.2}):
         transport = _AuditTransport(
             {"assessment": _assessment_payload_for(c3),
-             "company_research": _research_payload(job_posted="2026-09-01",
-                                                   job_posted_confidence="HIGH")},
+             "company_research": _research_payload(
+                 job_posted="2026-09-01", job_posted_confidence="HIGH",
+                 sources=[{"title": "Posting", "scope": "this_job",
+                           "url": BROWSED_SOURCE["url"],
+                           "evidence": "Posted 2026-09-01."}])},
             delays=delays)
         _client, audits = _run_audits(run, c3, transport)
         # Neither result is lost, whichever thread got there first.
@@ -5803,9 +5864,16 @@ def test_no_groq_experience_audit_remains_anywhere():
 
 # ================== AK. research source scoping, keys, daily limits, --assess
 
+SCOPED_URL = "https://example.com/x"
+
+
 def _scoped(scope: str, evidence: str, title: str = "Source") -> dict:
-    return {"title": title, "url": "https://example.com/x", "scope": scope,
-            "evidence": evidence}
+    return {"title": title, "url": SCOPED_URL, "scope": scope, "evidence": evidence}
+
+
+def _scoped_browsed() -> list[dict]:
+    """The browser really fetched the page every _scoped() source cites."""
+    return [{"url": SCOPED_URL, "title": "Source", "snippet": "", "via": "browser"}]
 
 
 # ---- source scoping -------------------------------------------------------
@@ -5818,7 +5886,8 @@ def test_an_unrelated_posting_cannot_establish_a_company_level_no():
          "sources": [_scoped("unrelated_posting",
                              "This role does not offer visa sponsorship.",
                              "A different job at the same company")]},
-        jd_text="We are hiring a backend engineer.")
+        jd_text="We are hiring a backend engineer.",
+        browser_sources=_scoped_browsed())
     assert research["company_visa_sponsorship"] == "UNKNOWN"
     assert research["company_visa_confidence"] == "LOW"
     assert any("cannot establish a company-wide position" in note
@@ -5832,7 +5901,8 @@ def test_an_official_company_policy_can_establish_yes_or_no():
              "checked_at": "2026-09-16",
              "sources": [_scoped("company_policy",
                                  "Our published policy on work authorization.")]},
-            jd_text="We are hiring a backend engineer.")
+            jd_text="We are hiring a backend engineer.",
+            browser_sources=_scoped_browsed())
         assert research["company_visa_sponsorship"] == verdict
 
 
@@ -5841,9 +5911,15 @@ def test_an_exact_job_restriction_overrides_a_company_level_yes():
         {"company_visa_sponsorship": "YES", "company_visa_confidence": "HIGH",
          "checked_at": "2026-09-16",
          "sources": [_scoped("company_policy", "We sponsor visas company-wide."),
-                     _scoped("this_job",
-                             "We are not able to sponsor visas for this position.")]},
-        jd_text="We are hiring a backend engineer.")
+                     {"title": "Acme Backend Engineer REQ-77", "scope": "this_job",
+                      "url": "https://example.com/jobs/REQ-77",
+                      "evidence": "We are not able to sponsor visas for this "
+                                  "position."}]},
+        jd_text="We are hiring a backend engineer.",
+        browser_sources=_scoped_browsed() + [
+            {"url": "https://example.com/jobs/REQ-77", "title": "Acme Backend Engineer",
+             "snippet": "", "via": "browser"}],
+        jd_job_id="REQ-77", company="Acme", title="Backend Engineer")
     assert research["company_visa_sponsorship"] == "NO"
     assert research["company_visa_confidence"] == "HIGH"
     assert any("job-specific restriction overrides" in note
@@ -5856,18 +5932,22 @@ def test_everify_inside_an_authoritative_source_still_cannot_prove_stem_opt():
          "checked_at": "2026-09-16",
          "sources": [_scoped("company_policy",
                              "We are an E-Verify participating employer.")]},
-        jd_text="We are hiring.")
+        jd_text="We are hiring.", browser_sources=_scoped_browsed())
     assert research["company_stem_opt_support"] == "UNKNOWN"
 
 
 def test_scope_labels_are_normalized_and_unknown_scopes_become_context():
+    """Normalization only. Whether a this_job label SURVIVES is identity."""
     for raw, expected in (("this-job", "this_job"), ("Company Wide", "company_policy"),
                           ("other_job", "unrelated_posting"), ("gossip", "context"),
                           (None, "context")):
-        research, _ = grounding.validate_company_research(
-            {"checked_at": "x", "sources": [_scoped(raw, "some evidence here")]},
-            jd_text="We are hiring.")
-        assert research["sources"][0]["scope"] == expected, raw
+        assert grounding._scope(raw) == expected, raw
+    # End to end, a normalized label still has to earn its scope: a this_job
+    # claim with no way to identify the posting is demoted to context.
+    research, _ = grounding.validate_company_research(
+        {"checked_at": "x", "sources": [_scoped("company_policy", "policy text")]},
+        jd_text="We are hiring.", browser_sources=_scoped_browsed())
+    assert research["sources"][0]["scope"] == "company_policy"
     assert grounding.SOURCE_SCOPES == ("this_job", "company_policy",
                                        "unrelated_posting", "context")
 
@@ -6509,7 +6589,7 @@ def test_parallelism_and_the_single_writer_are_untouched():
     code = _code_only(block)
     for forbidden in ("write_text", "write_json_atomic", "json.dump"):
         assert forbidden not in code
-    assert source.count("write_json_atomic(") == 4
+    assert source.count("write_json_atomic(") == 6
 
 
 # ================ AN. ITPM: input tokens per minute is a third ceiling
@@ -7158,7 +7238,7 @@ def test_the_architecture_is_untouched_by_the_schema_work():
     code = _code_only(block)
     for forbidden in ("write_text", "write_json_atomic", "json.dump"):
         assert forbidden not in code
-    assert source.count("write_json_atomic(") == 4
+    assert source.count("write_json_atomic(") == 6
     # Neither audit may reach Gemini.
     client_source = Path(_llm_client().__file__).read_text(encoding="utf-8")
     builder = client_source.split("def build_client(")[1]
@@ -8063,3 +8143,814 @@ def test_the_bae_repair_cycle_produces_a_valid_letter(run, bae):
     assert grounding.priority_addressed(letter, supported[1])
     assert grounding.letter_relevance(letter, priorities) == []
     assert 140 <= grounding.word_count(letter) <= 300
+
+
+# ================= AS. browser-required research and its provenance
+#
+# The live run's browser call failed with output_parse_fail, which the
+# transport read as "the browsing tool was rejected" and retried WITHOUT
+# browsing. That unbrowsed answer printed three URLs - one a fabricated
+# web.archive.org link - and concluded visa=NO at HIGH confidence. No browser
+# evidence means no current-policy conclusion, full stop.
+
+LIVE_PARSE_FAIL = ("Error code: 400 - {'error': {'message': \"Parsing failed. The model "
+                   "generated output that could not be parsed. Please adjust your prompt. "
+                   "See 'failed_generation' for more details.\", 'type': "
+                   "'invalid_request_error', 'code': 'output_parse_fail'}}")
+
+
+def _browsed(*urls, title="Fetched page", snippet="evidence text"):
+    return [{"url": url, "title": title, "snippet": snippet, "via": "browser"}
+            for url in urls]
+
+
+def _research_payload(**overrides):
+    payload = {"company_visa_sponsorship": "UNKNOWN", "company_visa_confidence": "LOW",
+               "company_stem_opt_support": "UNKNOWN", "company_stem_opt_confidence": "LOW",
+               "job_posted": "UNKNOWN", "job_posted_confidence": "LOW",
+               "checked_at": "2026-09-16", "sources": []}
+    payload.update(overrides)
+    return payload
+
+
+class _ResearchTransport:
+    """Scripted research transport that records web_search per attempt."""
+
+    name = "research-stub"
+
+    def __init__(self, script, provenance=None):
+        self.script = list(script)
+        self.provenance = provenance or {}
+        self.requests = []
+        self.last_browser_sources = []
+
+    def generate(self, request):
+        import llm_client
+
+        self.requests.append(request)
+        index = len(self.requests) - 1
+        self.last_browser_sources = list(self.provenance.get(index, []))
+        outcome = self.script[index] if index < len(self.script) else self.script[-1]
+        if isinstance(outcome, llm_client.ProviderError):
+            raise outcome
+        if isinstance(outcome, str):
+            return llm_client.Reply(outcome, self.name)
+        return llm_client.Reply(json.dumps(outcome), self.name)
+
+
+def _research_client(run, transport):
+    import logging
+
+    import llm_client
+
+    return llm_client.LLMClient(transport, transport, run["master"], run["policy"],
+                                 logging.getLogger("research"), audit=transport,
+                                 research=transport)
+
+
+# ---- A1: browsing is never optional -------------------------------------
+
+def test_company_research_always_requires_the_browser(run, bae):
+    transport = _ResearchTransport([_research_payload()],
+                                    provenance={0: _browsed("https://x.com/a")})
+    client = _research_client(run, transport)
+    client.research_company(bae["jd"], jd_posted="UNKNOWN", today="2026-09-16")
+
+    assert transport.requests, "the call must be made"
+    for request in transport.requests:
+        assert request.web_search is True, "browsing may never be switched off"
+        assert request.json is False
+
+
+def test_no_unbrowsed_research_path_remains_in_the_source():
+    source = Path(_llm_client().__file__).read_text(encoding="utf-8")
+    # The flag that existed only to serve the unbrowsed retry is gone.
+    assert "no_web_search" not in source
+    assert "without web search" not in source
+    assert "rejected the browsing tool" not in source
+    # The tool settings are guarded by web_search alone.
+    generate = source.split("def _generate(self, request: Request) -> str:")[1]
+    generate = generate.split("\n\n\n")[0]
+    assert "if request.web_search:" in generate
+    assert 'settings["tool_choice"] = "required"' in generate
+    # research_company never constructs a request with browsing off.
+    research = source.split("def research_company(")[1].split("\n    def ")[0]
+    assert "web_search=False" not in research
+    assert research.count("web_search=True") == 1, "one request shape, always browsed"
+    # And no other provider can answer this purpose.
+    assert "self.research" in research
+    assert "self.gemini" not in research and "self.audit" not in research
+
+
+# ---- A2: exactly one browser-required recovery --------------------------
+
+def test_output_parse_fail_gets_one_more_browser_required_attempt(run, bae):
+    import llm_client
+
+    transport = _ResearchTransport(
+        [llm_client.ProviderError("output_parse_failed", LIVE_PARSE_FAIL),
+         _research_payload(company_visa_sponsorship="NO", company_visa_confidence="HIGH",
+                           sources=[{"title": "FAQ", "scope": "company_policy",
+                                     "url": "https://bae.com/faq",
+                                     "evidence": "We do not sponsor."}])],
+        provenance={1: _browsed("https://bae.com/faq")})
+    client = _research_client(run, transport)
+    research = client.research_company(bae["jd"], jd_posted="UNKNOWN", today="2026-09-16")
+
+    assert len(transport.requests) == 2, "exactly one recovery attempt"
+    assert all(r.web_search is True for r in transport.requests)
+    # Attempt 2 differs ONLY in output formatting.
+    assert "could not be parsed" in transport.requests[1].prompt
+    assert "same evidence rules" in transport.requests[1].prompt
+    assert transport.requests[0].prompt in transport.requests[1].prompt
+    # With real provenance the recovered answer is usable.
+    assert research["research_available"] is True
+    assert research["company_visa_sponsorship"] == "NO"
+
+
+def test_research_never_makes_more_than_two_generations(run, bae):
+    import llm_client
+
+    transport = _ResearchTransport(
+        [llm_client.ProviderError("output_parse_failed", LIVE_PARSE_FAIL)] * 4)
+    client = _research_client(run, transport)
+    research = client.research_company(bae["jd"], jd_posted="UNKNOWN", today="2026-09-16")
+
+    assert len(transport.requests) == llm_client.RESEARCH_ATTEMPTS == 2
+    assert research["research_available"] is False
+
+
+@pytest.mark.parametrize("category", ["browser_unavailable", "auth_permission",
+                                      "daily_limit_exhausted"])
+def test_only_a_parse_failure_earns_a_second_attempt(run, bae, category):
+    """Browser unavailability is not a formatting problem; do not re-ask."""
+    import llm_client
+
+    transport = _ResearchTransport(
+        [llm_client.ProviderError(category, f"simulated {category}"), _research_payload()])
+    client = _research_client(run, transport)
+    research = client.research_company(bae["jd"], jd_posted="UNKNOWN", today="2026-09-16")
+
+    assert len(transport.requests) == 1, f"{category} must not be retried"
+    assert research["research_available"] is False
+    assert category in research["unavailable_reason"]
+
+
+def test_both_browser_attempts_failing_yields_unknown_everything(run, bae):
+    import llm_client
+
+    transport = _ResearchTransport(
+        [llm_client.ProviderError("output_parse_failed", LIVE_PARSE_FAIL),
+         llm_client.ProviderError("output_parse_failed", LIVE_PARSE_FAIL)])
+    client = _research_client(run, transport)
+    research = client.research_company(bae["jd"], jd_posted="UNKNOWN", today="2026-09-16")
+
+    assert research["research_available"] is False
+    assert research["company_visa_sponsorship"] == "UNKNOWN"
+    assert research["company_visa_confidence"] == "LOW"
+    assert research["company_stem_opt_support"] == "UNKNOWN"
+    assert research["company_stem_opt_confidence"] == "LOW"
+    assert research["job_posted"] == "UNKNOWN"
+    assert research["job_posted_confidence"] == "LOW"
+    assert research["unavailable_reason"]
+    assert research["sources"] == []
+    # The report renders the UNKNOWNs, and the resume is unaffected.
+    report = grounding.audit_report(research=research, letter_score=9.0)
+    assert report["Company Visa Sponsorship"] == "UNKNOWN"
+    assert report["Company STEM OPT Support"] == "UNKNOWN"
+    assert report["Job Posted"] == "UNKNOWN"
+
+
+# ---- A3: provenance, not printed URLs -----------------------------------
+
+def test_the_live_unbrowsed_answer_cannot_establish_any_policy():
+    """The exact payload the live retry produced, with no browser evidence."""
+    live = _research_payload(
+        company_visa_sponsorship="NO", company_visa_confidence="HIGH",
+        sources=[
+            {"title": "BAE Systems Careers", "scope": "unrelated_posting",
+             "url": "https://www.baesystems.com/en-us/careers", "evidence": "..."},
+            {"title": "BAE Systems Immigration FAQ", "scope": "company_policy",
+             "url": "https://www.baesystems.com/en-us/immigration-faq",
+             "evidence": "no sponsorship"},
+            {"title": "archived posting", "scope": "this_job",
+             "url": "https://web.archive.org/web/20260915000000/https://www.baesystems.com/x",
+             "evidence": "does not offer sponsorship"}])
+    research, problems = grounding.validate_company_research(
+        live, jd_text="Entry Level\nOnsite\n", browser_sources=[])
+
+    assert research["research_available"] is False
+    assert research["company_visa_sponsorship"] == "UNKNOWN"
+    assert research["company_visa_confidence"] == "LOW"
+    assert research["sources"] == []
+    assert any(p.kind == "provenance" for p in problems)
+    assert "model memory" in research["unavailable_reason"]
+
+
+def test_a_url_the_browser_never_fetched_is_discarded():
+    data = _research_payload(
+        company_visa_sponsorship="NO", company_visa_confidence="HIGH",
+        sources=[{"title": "FAQ", "scope": "company_policy",
+                  "url": "https://bae.com/en-us/immigration-faq",
+                  "evidence": "We do not sponsor."},
+                 {"title": "invented", "scope": "company_policy",
+                  "url": "https://bae.com/en-us/totally-made-up",
+                  "evidence": "also says no"}])
+    research, problems = grounding.validate_company_research(
+        data, jd_text="Entry Level\n",
+        browser_sources=_browsed("https://bae.com/en-us/immigration-faq"))
+
+    urls = [s["url"] for s in research["sources"]]
+    assert urls == ["https://bae.com/en-us/immigration-faq"]
+    assert any("not among the browser-fetched pages" in p.message for p in problems)
+    # A same-host invention does not inherit the real page's credibility.
+    assert "totally-made-up" not in json.dumps(research)
+
+
+def test_provenance_matching_ignores_scheme_and_www():
+    fetched = _browsed("https://www.bae.com/careers/job/123")
+    assert grounding.source_was_browsed({"url": "http://bae.com/careers/job/123"}, fetched)
+    assert grounding.source_was_browsed({"url": "https://bae.com/careers/job/123?x=1"},
+                                         fetched)
+    assert not grounding.source_was_browsed({"url": "https://bae.com/other"}, fetched)
+    assert not grounding.source_was_browsed({"url": ""}, fetched)
+    assert not grounding.source_was_browsed({"url": "https://bae.com/x"}, [])
+
+
+def test_browser_provenance_reads_the_providers_own_record():
+    import llm_client
+
+    class _Node:
+        def __init__(self, **kw):
+            for key, value in kw.items():
+                setattr(self, key, value)
+
+    message = _Node(executed_tools=[
+        _Node(browser_results=[_Node(url="https://a.com/p", title="A", content="one")],
+              search_results=_Node(results=[
+                  _Node(url="https://b.gov/q", title="B", content="two")])),
+    ])
+    found = llm_client.browser_provenance(message)
+    assert [entry["url"] for entry in found] == ["https://a.com/p", "https://b.gov/q"]
+    assert found[0]["via"] == "browser" and found[1]["via"] == "search"
+    assert found[0]["title"] == "A" and found[0]["snippet"] == "one"
+    # No execution record at all means no provenance.
+    assert llm_client.browser_provenance(_Node(executed_tools=None)) == []
+    assert llm_client.browser_provenance(None) == []
+
+
+def test_a_non_unknown_claim_keeps_its_supporting_fields():
+    data = _research_payload(
+        company_visa_sponsorship="YES", company_visa_confidence="HIGH",
+        sources=[{"title": "Immigration policy", "scope": "company_policy",
+                  "url": "https://acme.com/immigration",
+                  "evidence": "We sponsor work visas company-wide."}])
+    research, _ = grounding.validate_company_research(
+        data, jd_text="We are hiring.",
+        browser_sources=_browsed("https://acme.com/immigration"))
+
+    assert research["company_visa_sponsorship"] == "YES"
+    entry = research["sources"][0]
+    for field in ("url", "title", "evidence", "scope"):
+        assert entry[field], field
+    assert research["browser_sources"] == ["https://acme.com/immigration"]
+    assert research["company_visa_confidence"] in grounding.CONFIDENCE_LEVELS
+
+
+# ---- A4: the evidence policy is preserved -------------------------------
+
+def test_an_unrelated_posting_still_cannot_establish_company_wide_no():
+    data = _research_payload(
+        company_visa_sponsorship="NO", company_visa_confidence="HIGH",
+        sources=[{"title": "A different job", "scope": "unrelated_posting",
+                  "url": "https://acme.com/jobs/999",
+                  "evidence": "This role does not offer sponsorship."}])
+    research, _ = grounding.validate_company_research(
+        data, jd_text="We are hiring.", browser_sources=_browsed("https://acme.com/jobs/999"))
+    assert research["company_visa_sponsorship"] == "UNKNOWN"
+
+
+@pytest.mark.parametrize("source, jd_text, job_id, accepted", [
+    # strongest: the job id appears in the source
+    ({"url": "https://acme.com/jobs/REQ-4821", "title": "Engineer", "evidence": "no sponsorship"},
+     "Location: Austin, TX\n", "REQ-4821", True),
+    # acceptable: company + title + a location the POSTING states
+    ({"url": "https://acme.com/jobs/x", "title": "Acme Corp - Software Engineer Austin, TX",
+      "evidence": "Austin, TX role"}, "Location: Austin, TX\n", "", True),
+    # insufficient: title alone
+    ({"url": "https://acme.com/jobs/x", "title": "Software Engineer", "evidence": "no sponsorship"},
+     "Onsite\n", "", False),
+    # insufficient: geography-specific source, posting names no location
+    ({"url": "https://acme.com/jobs/x", "title": "Software Engineer Austin, TX",
+      "evidence": "Austin, TX"}, "Onsite\n", "", False),
+])
+def test_exact_job_identity_strength(source, jd_text, job_id, accepted):
+    ok, why = grounding.exact_job_identity(source, jd_text=jd_text, job_id=job_id,
+                                            company="Acme Corp", title="Software Engineer")
+    assert ok is accepted, why
+    assert why, "the reason is always stated"
+
+
+def test_a_weakly_identified_this_job_source_is_demoted_not_trusted():
+    data = _research_payload(
+        company_visa_sponsorship="NO", company_visa_confidence="HIGH",
+        sources=[{"title": "Software Engineer", "scope": "this_job",
+                  "url": "https://acme.com/jobs/x",
+                  "evidence": "This position does not offer sponsorship."}])
+    research, problems = grounding.validate_company_research(
+        data, jd_text="Onsite\nSoftware Engineering\n",
+        browser_sources=_browsed("https://acme.com/jobs/x"),
+        company="Acme Corp", title="Software Engineer")
+
+    assert research["sources"][0]["scope"] == "context", "demoted, not authoritative"
+    assert research["sources"][0]["scope_demoted"]
+    assert research["company_visa_sponsorship"] == "UNKNOWN"
+    assert any("exact audited posting" in p.message for p in problems)
+
+
+def test_an_exact_job_no_still_overrides_a_company_yes():
+    data = _research_payload(
+        company_visa_sponsorship="YES", company_visa_confidence="HIGH",
+        sources=[{"title": "Policy", "scope": "company_policy",
+                  "url": "https://acme.com/immigration",
+                  "evidence": "We sponsor visas company-wide."},
+                 {"title": "Acme Corp Software Engineer REQ-4821", "scope": "this_job",
+                  "url": "https://acme.com/jobs/REQ-4821",
+                  "evidence": "We are not able to sponsor visas for this position."}])
+    research, _ = grounding.validate_company_research(
+        data, jd_text="Location: Austin, TX\n",
+        browser_sources=_browsed("https://acme.com/immigration",
+                                 "https://acme.com/jobs/REQ-4821"),
+        jd_job_id="REQ-4821", company="Acme Corp", title="Software Engineer")
+
+    assert research["company_visa_sponsorship"] == "NO"
+    assert research["company_visa_confidence"] == "HIGH"
+    assert any("job-specific restriction overrides" in note
+               for note in research["deterministic_overrides"])
+
+
+def test_everify_and_h1b_rules_survive_the_provenance_change():
+    everify = _research_payload(
+        company_stem_opt_support="YES", company_stem_opt_confidence="HIGH",
+        sources=[{"title": "FAQ", "scope": "company_policy", "url": "https://acme.com/faq",
+                  "evidence": "We are an E-Verify participating employer."}])
+    research, _ = grounding.validate_company_research(
+        everify, jd_text="We are hiring.", browser_sources=_browsed("https://acme.com/faq"))
+    assert research["company_stem_opt_support"] == "UNKNOWN"
+
+    h1b = _research_payload(
+        company_visa_sponsorship="YES", company_visa_confidence="HIGH",
+        sources=[{"title": "LCA data", "scope": "company_policy",
+                  "url": "https://example.gov/lca",
+                  "evidence": "14 H-1B LCA filings certified in 2024."}])
+    research, _ = grounding.validate_company_research(
+        h1b, jd_text="We are hiring.", browser_sources=_browsed("https://example.gov/lca"))
+    assert research["company_visa_confidence"] == "MEDIUM"
+
+
+# ---- A5: classification, and no key rotation ----------------------------
+
+def test_the_live_failure_is_classified_as_a_parse_failure_not_a_tool_rejection():
+    import llm_client
+
+    assert llm_client.classify_http(400, LIVE_PARSE_FAIL) == "output_parse_failed"
+    assert llm_client.classify_exception(
+        Exception(LIVE_PARSE_FAIL)) == "output_parse_failed"
+    # A genuine tool refusal is its own thing.
+    for body in ("browser_search is not supported for this model",
+                 "tools are not available on this endpoint",
+                 "tool calling is not enabled"):
+        assert llm_client.classify_http(400, body) == "browser_unavailable", body
+    # And neither is confused with the categories that already existed.
+    assert llm_client.classify_http(400, "invalid json_schema") == "schema_rejected"
+    assert llm_client.classify_http(429, "TPM limit") == "rate_limited"
+    assert llm_client.classify_http(500, "internal") == "server_error"
+
+
+@pytest.mark.parametrize("category", ["output_parse_failed", "browser_unavailable"])
+def test_deterministic_request_failures_never_rotate_keys(category, monkeypatch):
+    import llm_client
+
+    monkeypatch.setattr(llm_client.time, "sleep", lambda _s: None)
+    assert category in llm_client.NON_RETRYABLE_CATEGORIES
+    assert category not in llm_client.KEY_SPECIFIC_CATEGORIES
+
+    seen: list[int] = []
+
+    def fail(self, request):
+        seen.append(self._key_index)
+        raise llm_client.ProviderError(category, f"simulated {category}")
+
+    transport = _stub_groq(generate=fail, model=RESEARCHER)
+    transport.keys = ("k1", "k2")
+    with pytest.raises(llm_client.ProviderError):
+        transport.generate(llm_client.Request("company_research", "p", web_search=True))
+    assert seen == [0], "a parser or tool bug is not a key problem"
+
+
+# ---- the frozen core is untouched ---------------------------------------
+
+def test_the_qwen_assessment_is_unchanged_by_the_research_work(run, c3):
+    import llm_client
+
+    request = _captured_audit_requests(run, c3)["assessment"]
+    assert request.max_tokens == 900
+    assert request.reasoning_effort == "none"
+    assert request.reasoning_format is None and request.include_reasoning is None
+    assert request.response_schema["json_schema"]["strict"] is True
+    assert request.web_search is False, "the assessment never browses"
+    assert len(llm_client.APPLICATION_ASSESSMENT_SCHEMA["properties"]) == 15
+
+
+def test_the_parallel_audits_stay_independent():
+    source = Path(run_pipeline.__file__).read_text(encoding="utf-8")
+    block = source.split("def run_audits(")[1].split("\ndef ")[0]
+    assert "ThreadPoolExecutor(max_workers=2)" in block
+    assert block.count("pool.submit(") == 2
+    code = _code_only(block)
+    for forbidden in ("write_text", "write_json_atomic", "json.dump"):
+        assert forbidden not in code
+
+
+# ================= AT. explicit stale-tracking reconciliation
+#
+# Stale detection already refuses to guess, preserves history and parks the
+# event. What was missing was a safe way for an operator to finish the job.
+# Every test here works on a temp tree; the real tracking files are never
+# opened.
+
+def _reconcile_tree(tmp_path, *, status="success", artifacts=True, finalized=True,
+                    indexed_folder="Vanished_2026-09-01_120000",
+                    parked=True, resolution="unresolved", jd_path=None):
+    """A stale-tracking situation in miniature, on disk, under tmp_path."""
+    output = tmp_path / "output"
+    output.mkdir(exist_ok=True)
+    jd = engine.read_jd(jd_path or BAE_JD)
+    run_dir = output / "BAE_Systems_Entry_Level_Software_Engineer_2026-09-16_034911"
+    run_dir.mkdir()
+    if artifacts:
+        for name in run_pipeline.REQUIRED_ARTIFACTS:
+            (run_dir / name).write_text("artifact", encoding="utf-8")
+        (run_dir / "job_description.txt").write_text(jd.text, encoding="utf-8")
+        (run_dir / "strategy.json").write_text(json.dumps({
+            "company_name": jd.company_name, "job_title": jd.job_title,
+            "jd_fingerprint": jd.fingerprint, "status": status}), encoding="utf-8")
+    if finalized:
+        (run_dir / "BAE_Systems_Entry_Level_Software_Engineer.pdf").write_bytes(b"%PDF fake")
+
+    index_path = tmp_path / ".processed_index.json"
+    csv_path = tmp_path / "processed_jobs.csv"
+    if indexed_folder is not None:
+        index_path.write_text(json.dumps({jd.fingerprint: {
+            "run_folder": indexed_folder, "source_file": "bae.txt",
+            "recorded_at": "2026-09-01T12:00:00"}}), encoding="utf-8")
+    csv_path.write_text("company_name,job_title,job_id,applied_at_date\n"
+                        "BAE Systems,Entry Level Software Engineer,,2026-09-01\n",
+                        encoding="utf-8")
+    reconcile_path = tmp_path / ".tracking_reconcile.json"
+    if parked:
+        reconcile_path.write_text(json.dumps([{
+            "fingerprint": jd.fingerprint, "indexed_run_folder": indexed_folder,
+            "indexed_folder_exists": False, "current_run_folder": run_dir.name,
+            "company_name": jd.company_name, "job_title": jd.job_title,
+            "job_id": jd.job_id, "source_file": "bae.txt",
+            "detected_at": "2026-09-16T03:53:20", "state": "stale_reference",
+            "resolution": resolution,
+            "note": "parked"}]), encoding="utf-8")
+    return {"jd": jd, "run_dir": run_dir, "output": output, "index": index_path,
+            "csv": csv_path, "reconcile": reconcile_path}
+
+
+def _run_reconcile(tree, *, apply=False):
+    return run_pipeline.reconcile_tracking(
+        tree["run_dir"], apply=apply, csv_path=tree["csv"], index_path=tree["index"],
+        reconcile_path=tree["reconcile"], output_dir=tree["output"])
+
+
+def _digests(tree):
+    import hashlib
+
+    out = {}
+    for key in ("index", "csv", "reconcile"):
+        path = tree[key]
+        out[key] = hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
+    return out
+
+
+# ---- the normal run still refuses to touch tracking --------------------
+
+def test_a_stale_run_still_mutates_nothing_by_itself(tmp_path, monkeypatch):
+    """Reconciliation is never automatic; the job run only parks the event."""
+    monkeypatch.setattr(engine, "OUTPUT_DIR", tmp_path / "output")
+    tree = _reconcile_tree(tmp_path, parked=False)
+    tracker = run_pipeline.Tracker(tree["csv"], tree["index"], enabled=True,
+                                   reconcile_path=tree["reconcile"])
+    before_index = tree["index"].read_bytes()
+    before_csv = tree["csv"].read_bytes()
+
+    import logging
+    outcome = tracker.record(tree["jd"], tree["run_dir"], "success",
+                             run_pipeline.StageLog(logging.getLogger("t"), "T"))
+
+    assert outcome.state == run_pipeline.TRACKING_STALE
+    assert tree["index"].read_bytes() == before_index
+    assert tree["csv"].read_bytes() == before_csv
+    # No auto-reconciliation anywhere in the run path.
+    source = Path(run_pipeline.__file__).read_text(encoding="utf-8")
+    run_one = source.split("def run_one(")[1].split("\ndef ")[0]
+    assert "reconcile_tracking(" not in run_one
+
+
+# ---- dry run is the default -------------------------------------------
+
+def test_the_default_mode_is_a_dry_run_with_zero_mutations(tmp_path):
+    tree = _reconcile_tree(tmp_path)
+    before = _digests(tree)
+
+    report = _run_reconcile(tree)
+
+    assert report.state == "would_repoint"
+    assert report.applied is False
+    assert report.ok is True
+    assert _digests(tree) == before, "a dry run writes nothing at all"
+    assert all(passed for _name, passed, _detail in report.checks)
+    assert "would repoint" in report.detail
+    assert "no" in report.detail and "row was appended" not in report.detail
+
+
+def test_the_cli_requires_apply_for_any_mutation():
+    source = Path(run_pipeline.__file__).read_text(encoding="utf-8")
+    assert '"--reconcile-tracking"' in source
+    assert '"--apply"' in source
+    cli = source.split('if args.reconcile_tracking:')[1].split("if args.assess")[0] \
+        if 'if args.assess' in source.split('if args.reconcile_tracking:')[1] \
+        else source.split('if args.reconcile_tracking:')[1].split("\n    if ")[0]
+    assert "apply=args.apply" in cli
+    assert "DRY RUN" in cli
+    # --apply is meaningless on its own, and says so.
+    assert "--apply only means something with --reconcile-tracking" in source
+
+
+# ---- validation refuses rather than guessing --------------------------
+
+def test_a_fingerprint_mismatch_refuses(tmp_path):
+    tree = _reconcile_tree(tmp_path)
+    # The stored JD is edited after the fact: it no longer hashes to what the
+    # run recorded, so the posting is not provably the same one.
+    (tree["run_dir"] / "job_description.txt").write_text(
+        tree["jd"].text + "\nAN EXTRA REQUIREMENT APPEARS.\n", encoding="utf-8")
+    before = _digests(tree)
+
+    report = _run_reconcile(tree, apply=True)
+
+    assert report.state == "refused"
+    assert "no longer hashes" in report.detail
+    assert _digests(tree) == before
+
+
+def test_an_incomplete_artifact_folder_refuses(tmp_path):
+    tree = _reconcile_tree(tmp_path)
+    (tree["run_dir"] / "assessment.txt").unlink()
+    before = _digests(tree)
+
+    report = _run_reconcile(tree, apply=True)
+
+    assert report.state == "refused"
+    assert "missing required artifact" in report.detail
+    assert _digests(tree) == before
+
+
+def test_an_unfinalized_run_refuses(tmp_path):
+    """No renamed PDF means finalize_artifacts never ran: not a shipped run."""
+    tree = _reconcile_tree(tmp_path, finalized=False)
+    (tree["run_dir"] / "resume.pdf").write_bytes(b"%PDF fake")
+    report = _run_reconcile(tree, apply=True)
+    assert report.state == "refused"
+    assert "PDF" in report.detail
+
+
+@pytest.mark.parametrize("status", ["needs_review", "failed", ""])
+def test_a_run_that_was_not_a_clean_success_refuses(tmp_path, status):
+    tree = _reconcile_tree(tmp_path, status=status)
+    before = _digests(tree)
+    report = _run_reconcile(tree, apply=True)
+    assert report.state == "refused"
+    assert "not a clean success" in report.detail
+    assert _digests(tree) == before
+
+
+def test_a_still_existing_indexed_folder_refuses(tmp_path):
+    """Nothing is stale, so nothing may be repointed."""
+    tree = _reconcile_tree(tmp_path, indexed_folder="Live_Run_2026-09-01_120000")
+    live = tree["output"] / "Live_Run_2026-09-01_120000"
+    live.mkdir()
+    before = _digests(tree)
+
+    report = _run_reconcile(tree, apply=True)
+
+    assert report.state == "refused"
+    assert "still exists" in report.detail
+    assert _digests(tree) == before
+
+
+def test_another_authoritative_run_refuses(tmp_path):
+    tree = _reconcile_tree(tmp_path)
+    rival = tree["output"] / "BAE_Systems_Entry_Level_Software_Engineer_2026-09-10_090000"
+    rival.mkdir()
+    for name in run_pipeline.REQUIRED_ARTIFACTS:
+        (rival / name).write_text("artifact", encoding="utf-8")
+    (rival / "job_description.txt").write_text(tree["jd"].text, encoding="utf-8")
+    (rival / "strategy.json").write_text(json.dumps({"status": "success"}),
+                                          encoding="utf-8")
+    (rival / "BAE_Systems_Entry_Level_Software_Engineer.pdf").write_bytes(b"%PDF")
+    before = _digests(tree)
+
+    report = _run_reconcile(tree, apply=True)
+
+    assert report.state == "refused"
+    assert "another complete run already covers" in report.detail
+    assert rival.name in report.detail
+    assert _digests(tree) == before
+
+
+def test_a_failed_rival_run_does_not_block_reconciliation(tmp_path):
+    """The real output/ holds exactly this: a needs_review attempt alongside."""
+    tree = _reconcile_tree(tmp_path)
+    failed = tree["output"] / "BAE_Systems_Entry_Level_Software_Engineer_2026-09-16_030804"
+    failed.mkdir()
+    for name in run_pipeline.REQUIRED_ARTIFACTS:
+        (failed / name).write_text("artifact", encoding="utf-8")
+    (failed / "job_description.txt").write_text(tree["jd"].text, encoding="utf-8")
+    (failed / "strategy.json").write_text(json.dumps({"status": "needs_review"}),
+                                           encoding="utf-8")
+    (failed / "resume.pdf").write_bytes(b"%PDF")     # never finalized
+
+    report = _run_reconcile(tree)
+
+    assert report.state == "would_repoint", report.detail
+
+
+def test_a_missing_reconciliation_entry_refuses(tmp_path):
+    tree = _reconcile_tree(tmp_path, parked=False)
+    report = _run_reconcile(tree, apply=True)
+    assert report.state == "refused"
+    assert "no reconciliation entry" in report.detail
+
+
+def test_incompatible_parked_metadata_refuses(tmp_path):
+    tree = _reconcile_tree(tmp_path)
+    parked = json.loads(tree["reconcile"].read_text(encoding="utf-8"))
+    parked[0]["company_name"] = "A Completely Different Employer"
+    tree["reconcile"].write_text(json.dumps(parked), encoding="utf-8")
+    before = _digests(tree)
+
+    report = _run_reconcile(tree, apply=True)
+
+    assert report.state == "refused"
+    assert "different posting" in report.detail
+    assert _digests(tree) == before
+
+
+def test_a_fingerprint_absent_from_the_index_refuses(tmp_path):
+    tree = _reconcile_tree(tmp_path, indexed_folder=None)
+    report = _run_reconcile(tree, apply=True)
+    assert report.state == "refused"
+    assert "not in the tracking index" in report.detail
+
+
+# ---- apply: one atomic repoint, no invented application ----------------
+
+def test_a_valid_apply_repoints_only_that_fingerprint(tmp_path):
+    tree = _reconcile_tree(tmp_path)
+    # A second, unrelated fingerprint must come through untouched.
+    index = json.loads(tree["index"].read_text(encoding="utf-8"))
+    index["other" + "f" * 59] = {"run_folder": "Other_Run_2026-09-02_100000",
+                                 "source_file": "other.txt",
+                                 "recorded_at": "2026-09-02T10:00:00"}
+    tree["index"].write_text(json.dumps(index), encoding="utf-8")
+    csv_before = tree["csv"].read_bytes()
+
+    report = _run_reconcile(tree, apply=True)
+
+    assert report.state == "repointed" and report.applied is True
+    after = json.loads(tree["index"].read_text(encoding="utf-8"))
+    assert after[tree["jd"].fingerprint]["run_folder"] == tree["run_dir"].name
+    assert after["other" + "f" * 59] == index["other" + "f" * 59], "untouched"
+    # 3. no duplicate application row
+    assert tree["csv"].read_bytes() == csv_before
+    assert "no" in report.detail and "row was appended" in report.detail
+
+
+def test_the_superseded_record_is_preserved(tmp_path):
+    tree = _reconcile_tree(tmp_path)
+    _run_reconcile(tree, apply=True)
+
+    entry = json.loads(tree["index"].read_text(encoding="utf-8"))[tree["jd"].fingerprint]
+    assert entry["reconciled_from"] == "Vanished_2026-09-01_120000"
+    assert entry["reconciled_at"]
+    # The original application's own record survives inline.
+    history = entry["superseded"]
+    assert len(history) == 1
+    assert history[0]["run_folder"] == "Vanished_2026-09-01_120000"
+    assert history[0]["recorded_at"] == "2026-09-01T12:00:00"
+    assert history[0]["missing_at"]
+    # The original recorded_at is not rewritten to "now".
+    assert entry["recorded_at"] == "2026-09-01T12:00:00"
+    assert entry["source_file"] == "bae.txt", "the original JD name, not the folder copy"
+
+
+def test_the_reconciliation_event_is_resolved_not_deleted(tmp_path):
+    tree = _reconcile_tree(tmp_path)
+    _run_reconcile(tree, apply=True)
+
+    entries = json.loads(tree["reconcile"].read_text(encoding="utf-8"))
+    assert len(entries) == 1, "the event is kept, not removed"
+    entry = entries[0]
+    assert entry["resolution"] == "repointed"
+    assert entry["resolved_run_folder"] == tree["run_dir"].name
+    assert entry["resolved_at"]
+    # The original diagnosis survives untouched.
+    assert entry["indexed_run_folder"] == "Vanished_2026-09-01_120000"
+    assert entry["state"] == run_pipeline.TRACKING_STALE
+    assert entry["detected_at"] == "2026-09-16T03:53:20"
+
+
+def test_the_index_write_is_atomic(tmp_path):
+    source = Path(run_pipeline.__file__).read_text(encoding="utf-8")
+    block = source.split("def reconcile_tracking(")[1].split("\ndef ")[0]
+    assert "_write_index_atomic(index_path, index)" in block
+    assert "index_path.write_text" not in block
+    writer = source.split("def _write_index_atomic(")[1].split("\ndef ")[0]
+    assert "write_json_atomic(" in writer
+    # And the shared atomic writer still has its contract.
+    atomic = source.split("def write_json_atomic(")[1].split("\ndef ")[0]
+    assert "os.replace(temp, path)" in atomic and "os.fsync(" in atomic
+
+
+# ---- idempotence -------------------------------------------------------
+
+def test_repeated_reconciliation_is_idempotent(tmp_path):
+    tree = _reconcile_tree(tmp_path)
+    first = _run_reconcile(tree, apply=True)
+    assert first.state == "repointed"
+    after_first = _digests(tree)
+    entry_first = json.loads(tree["index"].read_text(encoding="utf-8"))[
+        tree["jd"].fingerprint]
+
+    second = _run_reconcile(tree, apply=True)
+
+    assert second.state == "already"
+    assert "nothing to do" in second.detail
+    # Nothing moved: no new CSV row, no second mapping, no rewritten stamps.
+    assert _digests(tree) == after_first
+    entry_second = json.loads(tree["index"].read_text(encoding="utf-8"))[
+        tree["jd"].fingerprint]
+    assert entry_second == entry_first
+    assert len(json.loads(tree["reconcile"].read_text(encoding="utf-8"))) == 1
+    csv_rows = tree["csv"].read_text(encoding="utf-8").strip().splitlines()
+    assert len(csv_rows) == 2, csv_rows        # header plus the original row
+
+    # A dry run afterwards agrees, and still writes nothing.
+    third = _run_reconcile(tree)
+    assert third.state == "already"
+    assert _digests(tree) == after_first
+
+
+def test_an_already_resolved_entry_is_not_reprocessed(tmp_path):
+    tree = _reconcile_tree(tmp_path, resolution="repointed")
+    report = _run_reconcile(tree, apply=True)
+    assert report.state == "refused"
+    assert "already marked" in report.detail
+
+
+# ---- discovery afterwards ---------------------------------------------
+
+def test_discovery_recognises_the_reconciled_run(tmp_path):
+    """The whole point: the posting must not be regenerated afterwards."""
+    tree = _reconcile_tree(tmp_path)
+    jobs = tmp_path / "jobs"
+    jobs.mkdir()
+    (jobs / "bae.txt").write_text(tree["jd"].text, encoding="utf-8")
+
+    tracker = run_pipeline.Tracker(tree["csv"], tree["index"], enabled=True,
+                                   reconcile_path=tree["reconcile"])
+    # Before: the index names the vanished folder, and the JD is still skipped
+    # because the fingerprint is recorded - stale or not.
+    assert tracker.already_processed(tree["jd"].fingerprint) == \
+        "Vanished_2026-09-01_120000"
+
+    _run_reconcile(tree, apply=True)
+
+    # After: it points at the live run, and discovery skips on that basis.
+    assert tracker.already_processed(tree["jd"].fingerprint) == tree["run_dir"].name
+    pending, skipped = run_pipeline.discover_jobs(jobs, tracker)
+    assert [p.name for p in skipped] == ["bae.txt"]
+    assert pending == []
+
+
+def test_reconciliation_never_opens_the_real_tracking_files():
+    """Every path is parameterised, so tests and operators cannot collide."""
+    source = Path(run_pipeline.__file__).read_text(encoding="utf-8")
+    signature = source.split("def reconcile_tracking(")[1].split(") -> ReconcileReport:")[0]
+    for parameter in ("csv_path", "index_path", "reconcile_path", "output_dir"):
+        assert parameter in signature, parameter

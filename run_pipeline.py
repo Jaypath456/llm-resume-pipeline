@@ -2273,6 +2273,265 @@ def _skills_labels_from_tex(run_dir: Path) -> list[str]:
 # ===================================================================== batch
 
 
+@dataclass
+class ReconcileReport:
+    """The outcome of one reconciliation, dry-run or applied."""
+
+    state: str                       # refused | would_repoint | repointed | already
+    checks: list[tuple[str, bool, str]] = field(default_factory=list)
+    detail: str = ""
+    fingerprint: str = ""
+    stale_folder: str = ""
+    run_folder: str = ""
+    applied: bool = False
+
+    @property
+    def ok(self) -> bool:
+        return self.state in ("would_repoint", "repointed", "already")
+
+
+def reconcile_tracking(run_dir: Path, *, apply: bool = False,
+                       csv_path: Path | None = None, index_path: Path | None = None,
+                       reconcile_path: Path | None = None,
+                       output_dir: Path | None = None) -> ReconcileReport:
+    """Repoint ONE stale tracking fingerprint at a verified current run.
+
+    Dry-run by default: without `apply` nothing on disk is touched at all.
+    Every condition below must hold, and any ambiguity refuses rather than
+    guessing - the whole point of the stale-reference state is that the
+    pipeline would not guess either.
+    """
+    csv_path = csv_path or engine.PROCESSED_CSV
+    index_path = index_path or engine.PROCESSED_INDEX
+    reconcile_path = reconcile_path or (
+        index_path.with_name(".tracking_reconcile.json")
+        if index_path != engine.PROCESSED_INDEX else RECONCILE_PATH)
+    output_dir = output_dir or engine.OUTPUT_DIR
+    report = ReconcileReport(state="refused", run_folder=run_dir.name)
+    checks = report.checks
+
+    def check(name: str, condition: bool, detail: str = "") -> bool:
+        checks.append((name, bool(condition), detail))
+        return bool(condition)
+
+    def refuse(detail: str) -> ReconcileReport:
+        report.state = "refused"
+        report.detail = detail
+        return report
+
+    # 1. the requested run folder exists
+    if not check("run folder exists", run_dir.is_dir(), str(run_dir)):
+        return refuse(f"{run_dir} is not a directory")
+
+    # 2. the finalized artifacts are all present
+    missing = [name for name in REQUIRED_ARTIFACTS if not (run_dir / name).exists()]
+    pdfs = sorted(run_dir.glob("*.pdf"))
+    if not check("required artifacts present", not missing,
+                 "missing: " + ", ".join(missing) if missing else "all present"):
+        return refuse(f"{run_dir.name} is missing required artifact(s): "
+                      f"{', '.join(missing)}")
+    # A shipped run has exactly one PDF and it is the RENAMED one:
+    # finalize_artifacts only runs on success, so a lone resume.pdf means the
+    # run never finalized and was never an application.
+    finalized_pdfs = [p for p in pdfs if p.name != f"{RESUME_STEM}.pdf"]
+    if not check("exactly one finalized PDF", len(pdfs) == 1 and len(finalized_pdfs) == 1,
+                 ", ".join(p.name for p in pdfs) or "none"):
+        return refuse(f"{run_dir.name} does not hold exactly one finalized PDF "
+                      f"({', '.join(p.name for p in pdfs) or 'none'}); a shipped run's PDF "
+                      f"is renamed to <Company>_<Job_Title>.pdf")
+
+    # 3. the run is a verified success, or a success whose ONLY problem was
+    #    the stale tracking reference itself
+    try:
+        strategy = json.loads((run_dir / "strategy.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        check("strategy.json readable", False, str(error))
+        return refuse(f"{run_dir.name}/strategy.json could not be read: {error}")
+    status = str(strategy.get("status") or "")
+    issues = [str(i) for i in (strategy.get("issues") or [])]
+    non_tracking = [i for i in issues if "tracking not persisted" not in i]
+    verified = status in ("success", "success_with_tracking_warning") and not non_tracking
+    if not check("run verified successful", verified,
+                 f"status={status or 'unrecorded'}, other issues={non_tracking or 'none'}"):
+        return refuse(f"{run_dir.name} is not a clean success (status={status!r}; "
+                      f"unrelated issues: {non_tracking})")
+
+    # 4. the fingerprint reconstructs from the run's own stored JD
+    jd_file = run_dir / "job_description.txt"
+    try:
+        jd = engine.read_jd(jd_file)
+    except Exception as error:                   # noqa: BLE001 - reported below
+        check("fingerprint reconstructs", False, str(error))
+        return refuse(f"could not read {jd_file}: {error}")
+    fingerprint = jd.fingerprint
+    report.fingerprint = fingerprint
+    recorded = str(strategy.get("jd_fingerprint") or "")
+    if not check("fingerprint matches strategy.json", not recorded or recorded == fingerprint,
+                 f"stored={recorded[:12]} recomputed={fingerprint[:12]}"):
+        return refuse("the stored JD no longer hashes to the fingerprint this run "
+                      "recorded; refusing to reconcile an altered posting")
+
+    # 9. an unresolved reconciliation entry must exist for this pair
+    entries = _load_reconcile_entries(reconcile_path)
+    matching = [e for e in entries
+                if e.get("fingerprint") == fingerprint
+                and e.get("current_run_folder") == run_dir.name]
+    unresolved = [e for e in matching if e.get("resolution") == "unresolved"]
+    resolved = [e for e in matching if e.get("resolution") == "repointed"]
+    if not check("reconciliation entry exists", bool(matching),
+                 f"{len(entries)} entr(y/ies) parked"):
+        return refuse(f"no reconciliation entry links fingerprint {fingerprint[:12]} to "
+                      f"{run_dir.name}; only a parked stale reference can be reconciled")
+
+    # 5/6. the index must still name this fingerprint, and that folder must
+    #      still be missing - otherwise there is nothing stale to repair
+    try:
+        index = load_index(index_path)
+    except TrackingStateError as error:
+        check("tracking index readable", False, str(error))
+        return refuse(f"tracking index is unusable: {error}")
+    entry = index.get(fingerprint)
+    if not check("fingerprint present in index", isinstance(entry, dict),
+                 "absent" if entry is None else type(entry).__name__):
+        return refuse(f"fingerprint {fingerprint[:12]} is not in the tracking index; "
+                      f"this is not a stale-reference repair")
+    indexed = (entry.get("run_folder") or "").strip()
+    report.stale_folder = indexed
+    if indexed == run_dir.name:
+        # Already authoritative. Idempotent no-op, whatever the parked entry says.
+        check("already reconciled", True, indexed)
+        report.state = "already"
+        report.detail = (f"the index already points at {run_dir.name}; nothing to do")
+        if apply and unresolved:
+            _resolve_reconcile_entries(reconcile_path, entries, unresolved, run_dir.name)
+            report.applied = True
+            report.detail += " (the parked entry was marked resolved)"
+        return report
+    if not check("indexed folder is missing", not (output_dir / indexed).exists(),
+                 indexed or "empty"):
+        return refuse(f"the indexed run folder {indexed!r} still exists, so tracking is "
+                      f"not stale; refusing to repoint a live record")
+
+    # 7. no OTHER live folder is already AUTHORITATIVE for this fingerprint.
+    #    Authoritative means a finalized success: artifacts complete, the PDF
+    #    renamed by finalize_artifacts, and a clean status. A needs_review run
+    #    for the same posting is not a rival - it is a failed attempt, and the
+    #    real output/ directory holds exactly such a folder.
+    rivals = []
+    for candidate in sorted(output_dir.glob("*")):
+        if not candidate.is_dir() or candidate.name in (run_dir.name, indexed):
+            continue
+        stored = candidate / "job_description.txt"
+        if not stored.exists():
+            continue
+        try:
+            if engine.read_jd(stored).fingerprint != fingerprint:
+                continue
+        except Exception:                        # noqa: BLE001 - not a rival then
+            continue
+        if [n for n in REQUIRED_ARTIFACTS if not (candidate / n).exists()]:
+            continue
+        finalized = [p for p in candidate.glob("*.pdf")
+                     if p.name != f"{RESUME_STEM}.pdf"]
+        if len(finalized) != 1:
+            continue                             # never finalized, so never applied
+        try:
+            rival_status = str(json.loads(
+                (candidate / "strategy.json").read_text(encoding="utf-8")
+            ).get("status") or "")
+        except (OSError, json.JSONDecodeError):
+            continue
+        if rival_status in ("success", "success_with_tracking_warning"):
+            rivals.append(candidate.name)
+    if not check("no rival authoritative run", not rivals, ", ".join(rivals) or "none"):
+        return refuse(f"another complete run already covers this posting ({', '.join(rivals)}); "
+                      f"choose one explicitly rather than reconciling ambiguously")
+
+    # 8. metadata compatibility, where the parked entry recorded any
+    parked = (unresolved or resolved or matching)[0]
+    # company/title are posting identity. source_file is NOT: the parked entry
+    # records the original jobs/*.txt name while the run folder's copy is
+    # always job_description.txt, so comparing them can never match. The
+    # fingerprint already proves the posting text is byte-identical, which is
+    # a far stronger statement than a filename.
+    mismatches = [
+        f"{field}: parked={parked.get(field)!r} run={value!r}"
+        for field, value in (("company_name", jd.company_name),
+                             ("job_title", jd.job_title))
+        if parked.get(field) not in (None, "", value)]
+    if not check("metadata compatible", not mismatches, "; ".join(mismatches) or "compatible"):
+        return refuse("the parked entry describes a different posting than this run "
+                      f"({'; '.join(mismatches)})")
+    if not check("reconciliation entry unresolved", bool(unresolved),
+                 "unresolved" if unresolved else "already resolved"):
+        return refuse(f"the reconciliation entry for {run_dir.name} is already marked "
+                      f"{parked.get('resolution')!r}")
+
+    if not apply:
+        report.state = "would_repoint"
+        report.detail = (f"would repoint {fingerprint[:12]} from the missing {indexed!r} "
+                         f"to {run_dir.name}; no CSV row would be appended")
+        return report
+
+    # ---- the single mutation -------------------------------------------
+    # Only this fingerprint moves, and the record it replaces is kept inline
+    # so the history of the earlier application is not lost.
+    history = list(entry.get("superseded") or [])
+    history.append({k: entry.get(k) for k in ("run_folder", "source_file", "recorded_at")
+                    if entry.get(k)} | {"missing_at": datetime.now().isoformat(
+                        timespec="seconds")})
+    index[fingerprint] = {
+        "run_folder": run_dir.name,
+        # The original jobs/*.txt name, as the parked entry and the superseded
+        # record both spell it - not the run folder's job_description.txt copy.
+        "source_file": parked.get("source_file") or entry.get("source_file")
+                       or jd.source_file,
+        "recorded_at": entry.get("recorded_at") or datetime.now().isoformat(
+            timespec="seconds"),
+        "reconciled_at": datetime.now().isoformat(timespec="seconds"),
+        "reconciled_from": indexed,
+        "superseded": history,
+    }
+    _write_index_atomic(index_path, index)
+    _resolve_reconcile_entries(reconcile_path, entries, unresolved, run_dir.name)
+    report.state = "repointed"
+    report.applied = True
+    # The CSV is a human log of APPLICATIONS. This fingerprint already has one
+    # from the original run, so appending another would invent a second
+    # submission; the index stays the authority for skip decisions.
+    report.detail = (f"repointed {fingerprint[:12]} to {run_dir.name}; the previous record "
+                     f"for the missing {indexed!r} is preserved under 'superseded' and no "
+                     f"{csv_path.name} row was appended")
+    return report
+
+
+def _load_reconcile_entries(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    return [e for e in (loaded if isinstance(loaded, list) else [loaded])
+            if isinstance(e, dict)]
+
+
+def _resolve_reconcile_entries(path: Path, entries: list[dict], targets: list[dict],
+                               run_folder: str) -> None:
+    """Mark entries resolved in place. The event itself is never deleted."""
+    stamp = datetime.now().isoformat(timespec="seconds")
+    for entry in targets:
+        entry["resolution"] = "repointed"
+        entry["resolved_at"] = stamp
+        entry["resolved_run_folder"] = run_folder
+    write_json_atomic(path, entries)
+
+
+def _write_index_atomic(index_path: Path, index: dict) -> None:
+    """Same temp + fsync + os.replace contract the Tracker itself uses."""
+    write_json_atomic(index_path, index)
+
+
 def discover_jobs(folder: Path, tracker: Tracker) -> tuple[list[Path], list[Path]]:
     """Split `folder`/*.txt into (pending, already processed).
 
@@ -2379,9 +2638,30 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--revalidate", type=Path, default=None,
                         help="re-verify an existing run folder with zero API calls")
     parser.add_argument("--assess", type=Path, default=None, metavar="RUN_FOLDER",
-                        help="re-run the three Groq audits against an existing run folder; "
+                        help="re-run the Groq audits against an existing run folder; "
                              "regenerates nothing and never touches tracking")
+    parser.add_argument("--reconcile-tracking", type=Path, default=None,
+                        metavar="RUN_FOLDER",
+                        help="repoint one stale tracking fingerprint at this verified run. "
+                             "DRY RUN unless --apply is also given")
+    parser.add_argument("--apply", action="store_true",
+                        help="perform the mutation that --reconcile-tracking describes")
     args = parser.parse_args(argv)
+
+    if args.reconcile_tracking:
+        report = reconcile_tracking(args.reconcile_tracking, apply=args.apply)
+        print(f"\nRECONCILE {report.state.upper()}: {args.reconcile_tracking}")
+        for name, passed, detail in report.checks:
+            print(f"  [{'ok ' if passed else 'NO '}] {name}"
+                  + (f" ({detail})" if detail else ""))
+        if report.detail:
+            print(f"\n  {report.detail}")
+        if report.state == "would_repoint":
+            print("\n  DRY RUN: nothing was written. Re-run with --apply to perform it.")
+        return 0 if report.ok else 1
+
+    if args.apply and not args.reconcile_tracking:
+        parser.error("--apply only means something with --reconcile-tracking")
 
     if args.assess:
         if not args.assess.is_dir():
